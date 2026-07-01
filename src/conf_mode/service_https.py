@@ -69,11 +69,11 @@ def get_config(config=None):
 
     # store path to API config file for later use in templates
     https['api_config_state'] = api_config_state
-    # get fully qualified system hsotname
+    # get fully qualified system hostname
     https['hostname'] = socket.getfqdn()
 
     # We have gathered the dict representation of the CLI, but there are default
-    # options which we need to update into the dictionary retrived.
+    # options which we need to update into the dictionary retrieved.
     default_values = conf.get_config_defaults(**https.kwargs, recursive=True)
     if 'api' not in https or 'graphql' not in https['api']:
         del default_values['api']
@@ -107,17 +107,23 @@ def verify(https):
         Warning('No certificate specified, using build-in self-signed certificates. '\
                 'Do not use them in a production environment!')
 
-    # Check if server port is already in use by a different appliaction
+    # Check if server port is already in use by a different application
     listen_address = ['0.0.0.0']
     port = int(https['port'])
     if 'listen_address' in https:
         listen_address = https['listen_address']
 
-    for address in listen_address:
-        if not check_port_availability(address, port, 'tcp') and not is_listen_port_bind_service(port, 'nginx'):
-            raise ConfigError(f'TCP port "{port}" is used by another service!')
-
     verify_vrf(https)
+
+    vrf = https.get('vrf', None)
+    for address in listen_address:
+        if (not check_port_availability(address, port, 'tcp', vrf=vrf)
+            and not is_listen_port_bind_service(port, 'nginx')):
+            vrf_error_msg = ''
+            if vrf:
+                vrf_error_msg = f' in vrf "{vrf}"'
+            raise ConfigError(f'TCP port "{port}"{vrf_error_msg} is already ' \
+                               'used by another service!')
 
     # Verify API server settings, if present
     if 'api' in https:

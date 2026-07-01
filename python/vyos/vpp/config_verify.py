@@ -20,91 +20,153 @@ import psutil
 
 from vyos import ConfigError
 from vyos.base import Warning
+from vyos.utils.convert import range_str_to_list
 from vyos.utils.cpu import get_core_count as total_core_count, get_cpus
+from vyos.utils.dict import dict_search
+from vyos.utils.file import read_file
 
-from vyos.vpp.config_resource_checks import cpu as cpu_checks, memory as mem_checks
+from vyos.vpp.config_resource_checks import memory as mem_checks
 from vyos.vpp.config_resource_checks.resource_defaults import default_resource_map
 from vyos.vpp.utils import human_memory_to_bytes, bytes_to_human_memory
 
+# VPP feature paths that reference interfaces
+_VPP_FEATURE_INTERFACE_REFS = [
+    ('nat.cgnat.interface.inside', None, 'VPP CGNAT inside'),
+    ('nat.cgnat.interface.outside', None, 'VPP CGNAT outside'),
+    ('nat.nat44.interface.inside', None, 'VPP NAT44 inside'),
+    ('nat.nat44.interface.outside', None, 'VPP NAT44 outside'),
+    (
+        'nat.nat44.address_pool.translation.interface',
+        None,
+        'VPP NAT44 translation pool',
+    ),
+    ('nat.nat44.address_pool.twice_nat.interface', None, 'VPP NAT44 twice-NAT pool'),
+    ('nat.nat44.exclude.rule', 'external_interface', 'VPP NAT44 exclude rule external'),
+    ('acl.ip.interface', None, 'VPP IP ACL'),
+    ('acl.mac.interface', None, 'VPP MAC ACL'),
+    ('ipfix.interface', None, 'IPFIX monitoring'),
+    ('sflow.interface', None, 'VPP sFlow'),
+]
+# VPP member configuration paths that reference interfaces
+_VPP_MEMBER_INTERFACE_REFS = [
+    ('interfaces_vpp.bonding', 'member.interface', 'VPP bonding member'),
+    ('interfaces_vpp.bridge', 'member.interface', 'VPP bridge member'),
+    ('interfaces_vpp.xconnect', 'member.interface', 'VPP xconnect member'),
+]
 
-def verify_vpp_remove_kernel_interface(config: dict):
-    """Common verify for removed kernel-interfaces.
-    Verify that removed kernel interface are not used in 'vpp kernel-interfaces'.
+_VPP_INTERFACE_REFS = _VPP_FEATURE_INTERFACE_REFS + _VPP_MEMBER_INTERFACE_REFS
 
-    Example:
-      delete vpp interfaces gre|vxlan <tag>X kernel-interface vpp-tunX
-      set vpp kernel-interface vpp-tunX
+# Line width used by ConfigError for message formatting
+LINE_WIDTH = 72
+
+
+def vpp_interface_in_use(
+    iface: str, config: dict, match_vlans: bool = False, refs: list = None
+):
+    """Check if an interface is referenced in VPP config.
+
+    Args:
+        iface: interface name to check (e.g. 'eth0' or 'eth0.100')
+        config: config dict
+        match_vlans: if True, also match VLAN subinterfaces (e.g. 'eth0.100')
+        refs: list of (path, inner_path, feature_name) tuples to scan.
+              Defaults to _VPP_INTERFACE_REFS (all refs).
+              Use _VPP_FEATURE_INTERFACE_REFS or _VPP_MEMBER_INTERFACE_REFS to narrow scope.
+
+    Returns:
+        feature_name (str) if found, None otherwise
     """
-    if (
-        'remove' in config
-        and 'kernel_interface_removed' in config
-        and 'vpp_kernel_interfaces' in config
-    ):
-        removed_interfaces = config['kernel_interface_removed']
-        used_interfaces = config['vpp_kernel_interfaces']
+    if refs is None:
+        refs = _VPP_INTERFACE_REFS
 
-        for interface in removed_interfaces:
-            if interface in used_interfaces:
-                raise ConfigError(
-                    f'"{interface}" is still in use within "vpp kernel-interfaces". '
-                    'Please remove it before proceeding.'
-                )
+    def _matches(candidate):
+        """
+        Return True if 'candidate' matches 'iface' (optionally match subinterfaces).
+        'candidate' can be a string or a list/iterable of strings.
+        """
+        values = [candidate] if isinstance(candidate, str) else list(candidate)
+        for name in values:
+            if name == iface:
+                return True
+            if match_vlans and name.startswith(f'{iface}.'):
+                return True
+        return False
+
+    for path, inner_path, usage in refs:
+        data = dict_search(path, config)
+        if not data:
+            continue
+
+        if inner_path is not None:
+            for item_key, item_conf in data.items():
+                value = dict_search(inner_path, item_conf)
+                if value is not None and _matches(value):
+                    return usage
+        else:
+            if _matches(data):
+                return usage
+
+    return None
 
 
-def verify_vpp_change_kernel_interface(config: dict):
-    """Common verify for changed kernel-interface
-
-    Example:
-      set vpp interfaces gre|vxlan <tag> kernel-interface vpp-tunX'
-      commit
-      set vpp interfaces gre|vxlan <tag> kernel-interface vpp-tunY'
-      commit
-
-    check if we have kernel interface config 'vpp kernel-interface vpp-tunX'
+def verify_vpp_remove_interface(iface: str, config: dict, match_vlans: bool = False):
     """
-    kernel_interface_removed = config.get('kernel_interface_removed', [])
-    vpp_kernel_interfaces = config.get('vpp_kernel_interfaces', {})
-
-    for interface in kernel_interface_removed:
-        if interface in vpp_kernel_interfaces:
-            raise ConfigError(
-                f'interface "{interface}" is still in use within "vpp kernel-interfaces". '
-                f'Please remove it "vpp kernel-interface {interface}" before proceeding.'
-            )
-
-
-def verify_vpp_exists_kernel_interface(config: dict):
-    """Verify is a kernel-interface already created by another VPP LCP pair
-
-    Example:
-      set vpp interfaces vxlan vxlan10 kernel-interface vpp-tun10'
-      commit
-      set vpp interfaces vxlan vxlan20 kernel-interface vpp-tun10'
-      commit
+    Check that an interface is not referenced by any VPP feature.
+    Raises ConfigError if the interface is still referenced.
     """
-    kernel_interface = config.get('kernel_interface', '')
-    vpp_interface = config.get('ifname', '')
-    candidate_kernel_interfaces = config.get('candidate_kernel_interfaces', [])
+    feature = vpp_interface_in_use(iface, config, match_vlans)
+    if feature:
+        raise ConfigError(
+            f'Cannot remove interface "{iface}", '
+            f'{"it or its VLAN " if match_vlans else "it "}is still configured as {feature} interface'
+        )
 
-    for candidate_kernel_iface in candidate_kernel_interfaces:
-        if (
-            vpp_interface != candidate_kernel_iface[0]
-            and kernel_interface == candidate_kernel_iface[1]
-        ):
-            raise ConfigError(
-                f'Kernel interface "{kernel_interface}" is already configured for {candidate_kernel_iface[0]}. '
-                'Duplicates are not allowed.'
-            )
+
+def verify_vpp_interface_not_in_feature(iface: str, config: dict):
+    """Raise ConfigError if interface is used by a VPP feature (NAT, ACL, etc.).
+
+    Called from VPP interfaces scripts (bonding/bridge/xconnect) before adding a member.
+    """
+    feature = vpp_interface_in_use(iface, config, refs=_VPP_FEATURE_INTERFACE_REFS)
+    if feature:
+        raise ConfigError(
+            f'Interface {iface} is already used as {feature} interface '
+            f'and cannot be added as a member'
+        )
+
+
+def verify_vpp_interface_not_a_member(iface: str, config: dict):
+    """Raise ConfigError if interface is a member of bonding/bridge/xconnect.
+
+    Called from feature scripts (NAT, ACL, sFlow, etc.) before adding an interface.
+    """
+    member = vpp_interface_in_use(iface, config, refs=_VPP_MEMBER_INTERFACE_REFS)
+    if member:
+        raise ConfigError(
+            f'Interface {iface} is already used as {member} interface '
+            f'and cannot be added to a VPP feature'
+        )
 
 
 def verify_vpp_remove_xconnect_interface(config: dict):
-    if not config.get('remove'):
+    if not 'deleted' in config:
         return
     for xconn_member, xconn_iface in config.get('xconn_members').items():
         if xconn_member == config.get('ifname'):
             raise ConfigError(
-                f'interface "{xconn_member}" is still in use within "vpp interfaces xconnect". '
-                f'Please remove it from "vpp interface xconnect {xconn_iface}" before proceeding.'
+                f'interface "{xconn_member}" is still in use within "interfaces vpp xconnect". '
+                f'Please remove it from "interfaces vpp xconnect {xconn_iface}" before proceeding.'
+            )
+
+
+def verify_vpp_remove_bridge_interface(config: dict):
+    if not 'deleted' in config:
+        return
+    for bridge_member, bridge_iface in config.get('bridge_members').items():
+        if bridge_member == config.get('ifname'):
+            raise ConfigError(
+                f'interface "{bridge_member}" is still in use within "interfaces vpp bridge". '
+                f'Please remove it from "interfaces vpp bridge {bridge_iface}" before proceeding.'
             )
 
 
@@ -121,88 +183,51 @@ def verify_vpp_tunnel_source_address(config: dict):
     )
 
 
-def verify_dev_driver(driver_type: str, driver: str) -> bool:
-    # Lists of drivers compatible with DPDK and XDP
-    drivers_dpdk: list[str] = [
-        'atlantic',
-        'bnx2x',
-        'e1000',
-        'ena',
-        'gve',
-        'hv_netvsc',
-        'i40e',
-        'ice',
-        'igc',
-        'ixgbe',
-        'ixgbevf',
-        'liquidio',
-        'mlx4_core',
-        'mlx5_core',
-        'qede',
-        'sfc',
-        'tap',
-        'tun',
-        'virtio_net',
-        'vmxnet3',
-    ]
+def verify_member_conflicts(iface, config, current_type):
+    """
+    Check that a member interface is not already used by another interface type.
 
-    drivers_xdp: list[str] = [
-        'atlantic',
-        'ena',
-        'gve',
-        'hv_netvsc',
-        'i40e',
-        'ice',
-        'igb',
-        'igc',
-        'ixgbe',
-        'mlx4_core',
-        'mlx5_core',
-        'qede',
-        'sfc',
-        'tap',
-        'tun',
-        'virtio_net',
-        'vmxnet3',
-    ]
+    Args:
+        iface (str): interface name to check
+        config (dict): configuration dictionary
+        current_type (str): the membership type being assigned
+            to the interface ('bridge', 'bond', or 'xconn')
 
-    if driver_type == 'dpdk':
-        if driver in drivers_dpdk:
-            return True
-    # XDP support is intentionally disabled (T8202).
-    # XDP is no longer configurable via the CLI.
-    # This logic is kept commented out to make it easy
-    # to reintroduce XDP if there is a clear need in the future.
-    #
-    # elif driver_type == 'xdp':
-    #     if driver in drivers_xdp:
-    #         return True
-    else:
-        raise ConfigError(f'"Driver type {driver_type} is wrong')
-
-    return False
+    Raises:
+        ConfigError: If the interface is already a member of a conflicting interface type.
+    """
+    iface_type_map = {
+        'bridge': 'bridge',
+        'bond': 'bonding',
+        'xconn': 'xconnect',
+    }
+    for iface_type, label in iface_type_map.items():
+        if iface_type == current_type:
+            continue
+        members = config.get(f'{iface_type}_members', {}).get(iface)
+        if members:
+            raise ConfigError(
+                f'Interface {iface} cannot be a member of {iface_type_map[current_type]} '
+                f'because it already belongs to {label} interface(s): {", ".join(members)}.'
+            )
 
 
-def create_cpu_error_message(
-    cpus_required: int, cpus_available: int = None, skip_cores: int = 0
-) -> str:
+def create_cpu_error_message(cpus_required: int, cpus_available: int = None) -> str:
     cpu_info = get_cpus()
     logical_cores = sum(
         [int(s.get('siblings')) if 'siblings' in s else 1 for s in cpu_info]
     )
 
     reserved_cpus = default_resource_map.get('reserved_cpu_cores')
-    if skip_cores > reserved_cpus:
-        reserved_cpus = skip_cores
 
     available_str = (
         (
-            '---'.ljust(72)
-            + 'Reserved:'.ljust(72)
-            + f'For system: {reserved_cpus}'.ljust(72)
-            + f'VPP main thread: 1'.ljust(72)
-            + '---'.ljust(72)
-            + 'Available:'.ljust(72)
+            '---'.ljust(LINE_WIDTH)
+            + 'Reserved:'.ljust(LINE_WIDTH)
+            + f'For system: {reserved_cpus}'.ljust(LINE_WIDTH)
+            + f'VPP main thread: 1'.ljust(LINE_WIDTH)
+            + '---'.ljust(LINE_WIDTH)
+            + 'Available:'.ljust(LINE_WIDTH)
             + f'Physical cores: {max(cpus_available, 0)}'
         )
         if cpus_available is not None
@@ -210,13 +235,13 @@ def create_cpu_error_message(
     )
 
     message = (
-        '---'.ljust(72)
-        + 'Total in the system:'.ljust(72)
-        + f'Physical cores: {total_core_count()}'.ljust(72)
-        + f'Logical cores: {logical_cores}'.ljust(72)
-        + '---'.ljust(72)
-        + 'Required:'.ljust(72)
-        + f'Physical cores: {cpus_required}'.ljust(72)
+        '---'.ljust(LINE_WIDTH)
+        + 'Total in the system:'.ljust(LINE_WIDTH)
+        + f'Physical cores: {total_core_count()}'.ljust(LINE_WIDTH)
+        + f'Logical cores: {logical_cores}'.ljust(LINE_WIDTH)
+        + '---'.ljust(LINE_WIDTH)
+        + 'Required:'.ljust(LINE_WIDTH)
+        + f'Physical cores: {cpus_required}'.ljust(LINE_WIDTH)
         + available_str
     )
 
@@ -231,7 +256,7 @@ def verify_vpp_minimum_cpus():
     min_cpus = default_resource_map.get('min_cpus')
     if total_core_count() < min_cpus:
         raise ConfigError(
-            'This system does not meet minimal requirements for VPP. '.ljust(72)
+            'This system does not meet minimal requirements for VPP. '.ljust(LINE_WIDTH)
             + create_cpu_error_message(min_cpus)
         )
 
@@ -309,10 +334,10 @@ def verify_vpp_memory(config: dict):
 
     if errors:
         raise ConfigError(
-            'Not enough free memory to start VPP! '.ljust(72)
-            + '. '.join([line.ljust(72) for line in errors.values()])
+            'Not enough free memory to start VPP! '.ljust(LINE_WIDTH)
+            + '. '.join([line.ljust(LINE_WIDTH) for line in errors.values()])
             + (
-                'To add HugePages memory please use command '.ljust(72)
+                'To add HugePages memory please use command '.ljust(LINE_WIDTH)
                 + '"set system option kernel memory hugepage-size ..." and reboot!'
                 if any(k in errors for k in ('2M', '1G'))
                 else ''
@@ -320,136 +345,63 @@ def verify_vpp_memory(config: dict):
         )
 
 
-def verify_vpp_settings_cpu_skip_cores(skip_cores: int):
-    cpu_cores = total_core_count()
-
-    # The number of skipped cores must not be greater than
-    # available CPU cores in the system - 1 for main thread
-    if skip_cores > (cpu_cores - 1):
-        raise ConfigError(
-            f'The system does not have enough available CPUs to skip '
-            f'(reduce "cpu skip-cores" to {cpu_cores} or less)'
-        )
-
-
-def verify_vpp_settings_cpu(settings: dict):
+def verify_vpp_cpu_cores(cpu_cores: int):
     """
-    Verify 'cpu main-core' is set if worker-related settings are used.
-    `set vpp settings cpu workers` and `set vpp settings cpu corelist-workers`
-    are mutually exclusive!
+    Verify that the system has enough available and isolated CPU cores.
+
+    Checks performed:
+      1. The host has enough physical cores (minus reserved) for the requested
+         cpu_cores count.
+      2. The kernel actually has at least cpu_cores isolated CPUs
+         (read from /sys/devices/system/cpu/isolated).
+
+    Args:
+        cpu_cores: Total number of VPP CPU cores (1 main + N-1 workers).
+
+    Raises:
+        ConfigError: When any of the checks fail.
     """
-    worker_related = ('corelist_workers', 'workers', 'skip_cores')
+    total_cores = total_core_count()
+    reserved_cpus = default_resource_map.get('reserved_cpu_cores')
+    available_cores = total_cores - reserved_cpus
 
-    if any(key in settings for key in worker_related) and 'main_core' not in settings:
-        raise ConfigError('"cpu main-core" is required but not set!')
-
-    if 'corelist_workers' in settings and 'workers' in settings:
+    if cpu_cores > available_cores:
         raise ConfigError(
-            '"cpu corelist-workers" and "cpu workers" cannot be used at the same time!'
-        )
-
-
-def verify_vpp_cpu_main_core(cpu_settings: dict) -> None:
-    """Check that the main core is available"""
-    skip_cores = int(cpu_settings.get('skip_cores', 0))
-    available_cores = cpu_checks.available_cores_list(skip_cores)
-    main_core = int(cpu_settings['main_core'])
-
-    if main_core not in available_cores:
-        raise ConfigError(
-            'Cannot set main core for VPP process: '
-            f'CPU#{main_core} is not available.'
-        )
-
-
-def verify_vpp_settings_cpu_workers(cpu_settings: dict):
-    """
-    Verify that the system has enough available CPU cores
-    to run a given amount of worker processes (1 worker/core)
-    """
-    workers = int(cpu_settings.get('workers', 0))
-    available_cores = cpu_checks.available_cores_count(cpu_settings)
-
-    if workers > available_cores:
-        raise ConfigError(
-            f'Not enough free physical CPU cores for {workers} VPP workers '.ljust(72)
-            + create_cpu_error_message(
-                workers, available_cores, cpu_settings.get('skip_cores', 0)
+            f'Not enough free physical CPU cores for {cpu_cores} "cpu-cores" '.ljust(
+                LINE_WIDTH
             )
+            + create_cpu_error_message(cpu_cores, available_cores)
         )
 
+    # Read the set of CPUs the running kernel has actually isolated
+    isolated = read_file('/sys/devices/system/cpu/isolated')
+    isolated_cpus = range_str_to_list(isolated)
 
-def verify_vpp_settings_cpu_corelist_workers(cpu_settings: dict):
-    """
-    Verify that the CPU cores provided to the config are free and can be used by VPP
-    """
-    workers = cpu_settings.get('corelist_workers')
-    main_core = int(cpu_settings.get('main_core'))
-    skip_cores = int(cpu_settings.get('skip_cores', 0))
-    available_cores = cpu_checks.available_cores_list(skip_cores)
-    try:
-        all_core_nums = cpu_checks.worker_cores_list(
-            iface='cpu corelist', worker_ranges=workers
-        )
-    except ValueError as e:
-        raise ConfigError(str(e))
-
-    error_msg = 'Cannot set VPP "cpu corelist-workers": '.ljust(72)
-
-    if main_core in all_core_nums:
+    if cpu_cores > len(isolated_cpus):
         raise ConfigError(
-            f'CPU#{main_core} is set as main core and should not '
-            'be included to the corelist-workers'
-        )
-
-    invalid_cores = [str(el) for el in all_core_nums if el not in available_cores]
-    if invalid_cores:
-        raise ConfigError(error_msg + f'CPU# {",".join(invalid_cores)} not available.')
-
-    available_cores_count = cpu_checks.available_cores_count(cpu_settings)
-    if len(all_core_nums) > available_cores_count:
-        raise ConfigError(
-            error_msg
-            + 'Not enough free physical CPUs in the system.'.ljust(72)
-            + create_cpu_error_message(
-                len(all_core_nums), available_cores_count, skip_cores
+            'Not enough isolated CPU cores available: '.ljust(LINE_WIDTH)
+            + f'{cpu_cores} requested, but only {len(isolated_cpus)} isolated'
+            f'{f" (CPU#{isolated})" if len(isolated_cpus) > 0 else ""}. '.ljust(
+                LINE_WIDTH
             )
-        )
-
-
-def verify_vpp_nat44_workers(workers: int, nat44_workers: list):
-    if workers < 1:
-        raise ConfigError(
-            '"nat44 workers" requires cpu workers or corelist-workers to be set!'
-        )
-    try:
-        nat_workers = cpu_checks.worker_cores_list(
-            iface='nat44', worker_ranges=nat44_workers
-        )
-    except ValueError as e:
-        raise ConfigError(str(e))
-
-    invalid_workers = [str(el) for el in nat_workers if el not in range(workers)]
-    if invalid_workers:
-        raise ConfigError(
-            f'Cannot set VPP "nat44 workers": worker(s) #{",".join(invalid_workers)} not available. '
-            f'Available worker ids: {",".join(map(str, range(workers)))}'
+            + 'To isolate CPUs please use command '.ljust(LINE_WIDTH)
+            + '"set system option kernel cpu isolate-cpus ..." save and reboot!'
         )
 
 
 def verify_vpp_statseg_size(settings: dict):
     statseg_size = mem_checks.statseg_size(settings)
 
-    if 'size' in settings.get('statseg'):
+    if 'size' in settings['resource_allocation']['memory']['stats']:
         if statseg_size < 128 << 20:
-            raise ConfigError('The statseg size must be greater than or equal to 128M')
+            raise ConfigError('The "stats size" must be greater than or equal to 128M')
 
-    if 'page_size' in settings['statseg']:
+    if 'page_size' in settings['resource_allocation']['memory']['stats']:
         statseg_page_size = mem_checks.statseg_page_size(settings)
         if statseg_page_size > statseg_size:
             readable_statseg_page = bytes_to_human_memory(statseg_page_size, 'K')
             raise ConfigError(
-                f'The statseg size must be greater than or equal to page-size ({readable_statseg_page})'
+                f'The "stats size" must be greater than or equal to page-size ({readable_statseg_page})'
             )
 
 
@@ -461,12 +413,12 @@ def verify_vpp_interfaces_dpdk_num_queues(qtype: str, num_queues: int, workers: 
 
     if num_queues > workers:
         raise ConfigError(
-            f'The number of {qtype} queues cannot be greater than the number of configured VPP workers: '
-            f'workers: {workers}, queues: {num_queues}'
+            f'The number of {qtype} queues cannot be greater than the number of configured VPP "cpu-cores": '
+            f'cpu-cores: {workers}, queues: {num_queues}'
         )
 
 
-def verify_routes_count(settings: dict, workers: int):
+def verify_routes_count(settings: dict):
     """
     Maximum routes count depending on main heap size,
     statistics segment size and workers
@@ -474,12 +426,13 @@ def verify_routes_count(settings: dict, workers: int):
     counters = 2  # 2 counters for each route
     bytes = 16  # each counter consumes 16 bytes
     statseg_scale = 2
-    statseg_size = settings['statseg']['size']
+    cpu_cores = int(settings['resource_allocation']['cpu_cores'])
+    statseg_size = settings['resource_allocation']['memory']['stats']['size']
     statseg_size_in_bytes = human_memory_to_bytes(statseg_size)
-    main_heap = settings['memory']['main_heap_size']
+    main_heap = settings['resource_allocation']['memory']['main_heap_size']
     main_heap_in_gb = human_memory_to_bytes(main_heap) >> 30
 
-    formula = (workers + 1) * counters * bytes * statseg_scale
+    formula = cpu_cores * counters * bytes * statseg_scale
     routes_count_statseg = statseg_size_in_bytes / formula
     routes_count_statseg = round(routes_count_statseg / 1_000_000, 2)
     routes_count_mh = main_heap_in_gb * 2
@@ -492,13 +445,39 @@ def verify_routes_count(settings: dict, workers: int):
     )
 
 
-def verify_vpp_buffers(settings: dict, workers: int):
-    buffers_configured = int(settings['buffers']['buffers_per_numa'])
+def verify_vpp_buffers(settings: dict):
+    buffers_configured = int(
+        settings['resource_allocation']['buffers']['buffers_per_numa']
+    )
 
-    buffers_required = mem_checks.buffers_required(settings, workers)
+    buffers_required = mem_checks.buffers_required(settings)
 
     if buffers_required > buffers_configured:
         raise ConfigError(
             'Not enough buffers to initialize RX/TX queues for interfaces. '
-            f'Set "vpp settings buffers buffers-per-numa" to {buffers_required} or higher'
+            f'Set "vpp settings resource-allocation buffers buffers-per-numa" to {buffers_required} or higher'
         )
+
+
+def verify_nat_interfaces(config: dict, feature_name: str):
+    """
+    Verify that interfaces are not already used in the selected NAT feature.
+    Example:
+        verify_nat_interfaces(config, 'nat44')
+        verify_nat_interfaces(config, 'cgnat')
+    """
+    directions = ['inside', 'outside']
+    interfaces = config.get('interface', {})
+    nat_interfaces = config.get(f'{feature_name}_config', {}).get('interface', {})
+
+    for direction in directions:
+        for iface in interfaces.get(direction, []):
+            # Check if iface is used in any nat44/cgnat direction
+            nat_dir = next(
+                (d for d in directions if iface in nat_interfaces.get(d, [])), None
+            )
+            if nat_dir:
+                raise ConfigError(
+                    f'Cannot use {iface} as {direction} interface: '
+                    f'it is already configured as {nat_dir} interface in {feature_name.upper()}'
+                )

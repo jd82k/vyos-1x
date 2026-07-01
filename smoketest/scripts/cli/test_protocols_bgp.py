@@ -40,7 +40,7 @@ bfd_profile = 'foo-bar-baz'
 
 import_afi = 'ipv4-unicast'
 import_vrf = 'red'
-import_rd = ASN + ':100'
+import_rd = f'{ASN}:100'
 import_vrf_base = ['vrf', 'name']
 neighbor_config = {
     '192.0.2.1' : {
@@ -64,7 +64,7 @@ neighbor_config = {
         },
     '192.0.2.2' : {
         'bfd_profile'      : bfd_profile,
-        'remote_as'        : '200',
+        'remote_as'        : 'auto',
         'shutdown'         : '',
         'no_cap_nego'      : '',
         'port'             : '667',
@@ -111,7 +111,7 @@ neighbor_config = {
         'local_role_strict': '',
         },
     '2001:db8::2' : {
-        'remote_as'        : '456',
+        'remote_as'        : 'auto',
         'shutdown'         : '',
         'no_cap_nego'      : '',
         'port'             : '667',
@@ -141,7 +141,7 @@ peer_group_config = {
         'p_attr_discard'   : ['100', '150', '200'],
         },
     'bar' : {
-        'remote_as'        : '111',
+        'remote_as'        : 'auto',
         'graceful_rst_no'  : '',
         'port'             : '667',
         'p_attr_taw'       : '126',
@@ -329,6 +329,8 @@ class TestProtocolsBGP(VyOSUnitTestSHIM.TestCase):
         tcp_keepalive_idle = '66'
         tcp_keepalive_interval = '77'
         tcp_keepalive_probes = '22'
+        max_delay = '120'
+        establish_wait = '60'
 
         self.cli_set(base_path + ['parameters', 'allow-martian-nexthop'])
         self.cli_set(base_path + ['parameters', 'disable-ebgp-connected-route-check'])
@@ -376,6 +378,21 @@ class TestProtocolsBGP(VyOSUnitTestSHIM.TestCase):
         self.cli_set(base_path + ['address-family', 'ipv6-unicast', 'maximum-paths', 'ebgp', max_path_v6])
         self.cli_set(base_path + ['address-family', 'ipv6-unicast', 'maximum-paths', 'ibgp', max_path_v6ibgp])
 
+        # BGP update-delay
+        self.cli_set(
+            base_path + ['parameters', 'update-delay', 'establish-wait', '200']
+        )
+        # establish-wait should not be set without max-delay
+        with self.assertRaises(ConfigSessionError):
+            self.cli_commit()
+        self.cli_set(base_path + ['parameters', 'update-delay', 'max-delay', max_delay])
+        # establish-wait should not be greater than max-delay
+        with self.assertRaises(ConfigSessionError):
+            self.cli_commit()
+        self.cli_set(
+            base_path + ['parameters', 'update-delay', 'establish-wait', establish_wait]
+        )
+
         # commit changes
         self.cli_commit()
 
@@ -408,6 +425,7 @@ class TestProtocolsBGP(VyOSUnitTestSHIM.TestCase):
         self.assertIn(f' bgp tcp-keepalive {tcp_keepalive_idle} {tcp_keepalive_interval} {tcp_keepalive_probes}', frrconfig)
         self.assertNotIn(f'bgp ebgp-requires-policy', frrconfig)
         self.assertIn(f' no bgp suppress-duplicates', frrconfig)
+        self.assertIn(f' update-delay {max_delay} {establish_wait}', frrconfig)
 
         afiv4_config = self.getFRRconfig(f'router bgp {ASN}', stop_section='^exit',
                                          start_subsection=' address-family ipv4 unicast',
@@ -1638,6 +1656,70 @@ class TestProtocolsBGP(VyOSUnitTestSHIM.TestCase):
         self.assertIn(f' bgp router-id {router_id}', frr_vrf_config)
 
 
+    def test_bgp_31_as_notation(self):
+        # Test BGP AS-notation output format for both global and VRF BGP instances.
+        # Verify all three notation types render correctly on the router bgp line.
+        router_id = '127.0.0.4'
+        vrf = 'red'
+
+        for vrf in ['', 'red']:
+            vrf_base = ['vrf', 'name', vrf] if vrf else []
+            vrf_frr_bit = f' vrf {vrf}' if vrf else ''
+            bgp_path = vrf_base + base_path
+
+            if vrf_base:
+                self.cli_set(vrf_base + ['table', '2000'])
+
+            self.cli_set(bgp_path + ['system-as', ASN])
+            self.cli_set(bgp_path + ['parameters', 'router-id', router_id])
+
+            for notation in ['asdot', 'asdot+']:
+                self.cli_set(bgp_path + ['parameters', 'as-notation', notation])
+                self.cli_commit()
+
+                # our config options are called 'asdot' and 'asdot+' as in
+                # RFC 5396
+                # but FRR calls them 'dot' and 'dot+' in the router bgp line
+                # e.g. router bgp 12345 as-notation dot
+                # or
+                # router bgp 12345 vrf red as-notation dot
+                router_str = f'router bgp {ASN}{vrf_frr_bit} as-notation {notation.replace("as", "")}'
+                # getFRRConfig interprets the arguments as regex, so escape '+' if present
+                frrconfig = self.getFRRconfig(
+                    router_str.replace('+', r'\+'), stop_section='^exit'
+                )
+                self.assertIn(router_str, frrconfig)
+
+            # Verify removing as-notation works
+            self.cli_delete(bgp_path + ['parameters', 'as-notation'])
+            self.cli_commit()
+
+            router_str = f'router bgp {ASN}{vrf_frr_bit}'
+
+            frrconfig = self.getFRRconfig(router_str, stop_section='^exit')
+            self.assertIn(router_str, frrconfig)
+            self.assertNotIn('as-notation', frrconfig.splitlines()[0])
+
+            # Cleanup
+            self.cli_delete(bgp_path)
+            if vrf_base:
+                self.cli_delete(vrf_base)
+
+            self.cli_commit()
+
+    def test_bgp_32_bfd_strict(self):
+        neighbor = '192.0.2.22'
+        bfd_hold_time = '23'
+
+        self.cli_set(base_path + ['neighbor', neighbor, 'remote-as', ASN])
+        self.cli_set(base_path + ['neighbor', neighbor, 'bfd', 'strict', 'hold-time', bfd_hold_time])
+
+        self.cli_commit()
+
+        frrconfig = self.getFRRconfig(f'router bgp {ASN}', stop_section='^exit')
+        self.assertIn(f'router bgp {ASN}', frrconfig)
+        self.assertIn(f' neighbor {neighbor} bfd strict hold-time {bfd_hold_time}', frrconfig)
+
     def test_bgp_99_bmp(self):
         target_name = 'instance-bmp'
         target_address = '127.0.0.1'
@@ -1697,6 +1779,22 @@ class TestProtocolsBGP(VyOSUnitTestSHIM.TestCase):
         self.assertIn(f'bmp monitor ipv4 unicast loc-rib', frrconfig)
         self.assertIn(f'bmp monitor ipv6 unicast loc-rib', frrconfig)
         self.assertIn(f'bmp connect {target_address} port {target_port} min-retry {min_retry} max-retry {max_retry}', frrconfig)
+
+    def test_bgp_100_link_state(self):
+        router_id = '127.0.0.1'
+        peer = '192.0.3.3'
+        peer_asn = '100'
+
+        self.cli_set(base_path + ['parameters', 'router-id', router_id])
+        self.cli_set(base_path + ['neighbor', peer, 'remote-as', peer_asn])
+
+        self.cli_set(base_path + ['neighbor', peer, 'address-family', 'link-state'])
+
+        self.cli_commit()
+
+        # Verify FRR bgpd configuration
+        frrconfig = self.getFRRconfig(f'router bgp {ASN}', stop_section='^exit')
+        self.assertIn(f' address-family link-state', frrconfig)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2, failfast=VyOSUnitTestSHIM.TestCase.debug_on())

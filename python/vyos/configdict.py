@@ -430,7 +430,7 @@ def get_interface_dict(config, base, ifname='', recursive_defaults=True, with_pk
     """
     Common utility function to retrieve and mangle the interfaces configuration
     from the CLI input nodes. All interfaces have a common base where value
-    retrival is identical. This function must be used whenever possible when
+    retrieval is identical. This function must be used whenever possible when
     working on the interfaces node!
 
     Return a dictionary with the necessary interface config keys.
@@ -472,7 +472,7 @@ def get_interface_dict(config, base, ifname='', recursive_defaults=True, with_pk
 
     # Check if QoS policy applied on this interface - See ifconfig.interface.set_mirror_redirect()
     if config.exists(['qos', 'interface', ifname]):
-        dict.update({'traffic_policy': {}})
+        dict.update({'qos': {}})
 
     address = leaf_node_changed(config, base + [ifname, 'address'])
     if address: dict.update({'address_old' : address})
@@ -489,14 +489,14 @@ def get_interface_dict(config, base, ifname='', recursive_defaults=True, with_pk
     bond = is_member(config, ifname, 'bonding')
     if bond: dict.update({'is_bond_member' : bond})
 
-    # Check if any DHCP options changed which require a client restat
+    # Check if any DHCP options changed which require a client restart
     dhcp = is_node_changed(config, base + [ifname, 'dhcp-options'])
     if dhcp: dict.update({'dhcp_options_changed' : {}})
     dhcpv6 = is_node_changed(config, base + [ifname, 'dhcpv6-options'])
     if dhcpv6: dict.update({'dhcpv6_options_changed' : {}})
 
     # Some interfaces come with a source_interface which must also not be part
-    # of any other bond or bridge interface as it is exclusivly assigned as the
+    # of any other bond or bridge interface as it is exclusively assigned as the
     # Kernels "lower" interface to this new "virtual/upper" interface.
     if 'source_interface' in dict:
         # Check if source interface is member of another bridge
@@ -531,7 +531,7 @@ def get_interface_dict(config, base, ifname='', recursive_defaults=True, with_pk
         dict['vif'][vif].update({'ifname' : f'{ifname}.{vif}'})
 
         if config.exists(['qos', 'interface', f'{ifname}.{vif}']):
-            dict['vif'][vif].update({'traffic_policy': {}})
+            dict['vif'][vif].update({'qos': {}})
 
         if 'deleted' not in dict:
             address = leaf_node_changed(config, base + [ifname, 'vif', vif, 'address'])
@@ -558,7 +558,7 @@ def get_interface_dict(config, base, ifname='', recursive_defaults=True, with_pk
         dict['vif_s'][vif_s].update({'ifname' : f'{ifname}.{vif_s}'})
 
         if config.exists(['qos', 'interface', f'{ifname}.{vif_s}']):
-            dict['vif_s'][vif_s].update({'traffic_policy': {}})
+            dict['vif_s'][vif_s].update({'qos': {}})
 
         if 'deleted' not in dict:
             address = leaf_node_changed(config, base + [ifname, 'vif-s', vif_s, 'address'])
@@ -586,7 +586,7 @@ def get_interface_dict(config, base, ifname='', recursive_defaults=True, with_pk
             dict['vif_s'][vif_s]['vif_c'][vif_c].update({'ifname' : f'{ifname}.{vif_s}.{vif_c}'})
 
             if config.exists(['qos', 'interface', f'{ifname}.{vif_s}.{vif_c}']):
-                dict['vif_s'][vif_s]['vif_c'][vif_c].update({'traffic_policy': {}})
+                dict['vif_s'][vif_s]['vif_c'][vif_c].update({'qos': {}})
 
             if 'deleted' not in dict:
                 address = leaf_node_changed(config, base + [ifname, 'vif-s', vif_s, 'vif-c', vif_c, 'address'])
@@ -666,7 +666,7 @@ def get_accel_dict(config, base, chap_secrets, with_pki=False):
     """
     Common utility function to retrieve and mangle the Accel-PPP configuration
     from different CLI input nodes. All Accel-PPP services have a common base
-    where value retrival is identical. This function must be used whenever
+    where value retrieval is identical. This function must be used whenever
     possible when working with Accel-PPP services!
 
     Return a dictionary with the necessary interface config keys.

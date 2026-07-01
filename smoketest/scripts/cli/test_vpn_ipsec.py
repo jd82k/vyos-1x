@@ -47,6 +47,7 @@ vif = '100'
 esp_group = 'MyESPGroup'
 ike_group = 'MyIKEGroup'
 secret = 'MYSECRETKEY'
+ppk_secret_hex = '55c2ebca1bada7ac0e4e1390a8dbb563cefea0c7bd59f4f2c86a627f5927fb90'
 PROCESS_NAME = 'charon-systemd'
 regex_uuid4 = '[0-9a-fA-F]{8}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{12}'
 
@@ -668,6 +669,139 @@ class TestVPNIPsec(VyOSUnitTestSHIM.TestCase):
         for line in swanctl_conf_lines:
             self.assertIn(line, swanctl_conf)
 
+    def test_site_to_site_nist_800_77_cnsa_1_with_ppk(self):
+        # Setup IKE group
+        self.cli_set(base_path + ['ike-group', 'cnsa1-ike', 'key-exchange', 'ikev2'])
+        self.cli_set(base_path + ['ike-group', 'cnsa1-ike', 'lifetime', '86400'])
+        self.cli_set(
+            base_path + ['ike-group', 'cnsa1-ike', 'proposal', '10', 'dh-group', '20']
+        )
+        self.cli_set(
+            base_path
+            + ['ike-group', 'cnsa1-ike', 'proposal', '10', 'encryption', 'aes256gcm128']
+        )
+        self.cli_set(
+            base_path + ['ike-group', 'cnsa1-ike', 'proposal', '10', 'hash', 'sha384']
+        )
+        self.cli_set(
+            base_path + ['ike-group', 'cnsa1-ike', 'proposal', '10', 'prf', 'prfsha384']
+        )
+
+        # Setup ESP group
+        self.cli_set(base_path + ['esp-group', 'cnsa1-esp', 'lifetime', '28800'])
+        self.cli_set(base_path + ['esp-group', 'cnsa1-esp', 'mode', 'tunnel'])
+        self.cli_set(base_path + ['esp-group', 'cnsa1-esp', 'pfs', 'dh-group20'])
+        self.cli_set(
+            base_path
+            + ['esp-group', 'cnsa1-esp', 'proposal', '10', 'encryption', 'aes256gcm128']
+        )
+        self.cli_set(
+            base_path + ['esp-group', 'cnsa1-esp', 'proposal', '10', 'hash', 'sha384']
+        )
+
+        local_address = '192.0.2.10'
+
+        # vpn ipsec auth psk <tag> id <x.x.x.x>
+        self.cli_set(
+            base_path + ['authentication', 'psk', connection_name, 'id', local_id]
+        )
+        self.cli_set(
+            base_path + ['authentication', 'psk', connection_name, 'id', remote_id]
+        )
+        self.cli_set(
+            base_path + ['authentication', 'psk', connection_name, 'id', local_address]
+        )
+        self.cli_set(
+            base_path + ['authentication', 'psk', connection_name, 'id', peer_ip]
+        )
+        self.cli_set(
+            base_path + ['authentication', 'psk', connection_name, 'secret', secret]
+        )
+
+        # vpn ipsec auth ppk <tag> id <name>
+        self.cli_set(
+            base_path + ['authentication', 'ppk', connection_name, 'id', 'ppk-test']
+        )
+        self.cli_set(
+            base_path
+            + ['authentication', 'ppk', connection_name, 'secret', ppk_secret_hex]
+        )
+        self.cli_set(
+            base_path + ['authentication', 'ppk', connection_name, 'secret-type', 'hex']
+        )
+
+        # Site to site
+        peer_base_path = base_path + ['site-to-site', 'peer', connection_name]
+
+        self.cli_set(peer_base_path + ['authentication', 'mode', 'pre-shared-secret'])
+
+        # Require use of valid PPK
+        self.cli_set(peer_base_path + ['authentication', 'ppk', 'id', 'ppk-test'])
+        self.cli_set(peer_base_path + ['authentication', 'ppk', 'required'])
+
+        # Set childless IKE_INIT to prefer
+        self.cli_set(peer_base_path + ['childless', 'prefer'])
+
+        self.cli_set(peer_base_path + ['default-esp-group', 'cnsa1-esp'])
+        self.cli_set(peer_base_path + ['ike-group', 'cnsa1-ike'])
+        self.cli_set(peer_base_path + ['local-address', local_address])
+
+        self.cli_set(peer_base_path + ['remote-address', peer_ip])
+        self.cli_set(
+            peer_base_path + ['tunnel', '1', 'local', 'prefix', '172.16.10.0/24']
+        )
+        self.cli_set(
+            peer_base_path + ['tunnel', '1', 'remote', 'prefix', '172.17.10.0/24']
+        )
+
+        self.cli_commit()
+
+        # Verify strongSwan configuration
+        swanctl_conf = read_file(swanctl_file)
+        swanctl_conf_lines = [
+            f'ppk_id = ppk-test',
+            f'ppk_required = yes',
+            f'childless = prefer',
+            f'version = 2',
+            f'auth = psk',
+            f'rekey_time = 86400s',
+            f'proposals = aes256gcm128-sha384-prfsha384-ecp384',
+            f'esp_proposals = aes256gcm128-sha384-ecp384',
+            f'life_time = 28800s',  # default value
+            f'local_addrs = {local_address} # dhcp:no',
+            f'remote_addrs = {peer_ip}',
+            f'mode = tunnel',
+            f'{connection_name}-tunnel-1',
+            f'local_ts = 172.16.10.0/24',
+            f'remote_ts = 172.17.10.0/24',
+            f'mode = tunnel',
+            f'replay_window = 32',
+        ]
+        for line in swanctl_conf_lines:
+            self.assertIn(line, swanctl_conf)
+
+        # if dpd is not specified it should not be enabled (see T6599)
+        swanctl_unexpected_lines = [
+            'dpd_timeout',
+            'dpd_delay',
+        ]
+
+        for unexpected_line in swanctl_unexpected_lines:
+            self.assertNotIn(unexpected_line, swanctl_conf)
+
+        swanctl_secrets_lines = [
+            f'id-{regex_uuid4} = "{local_id}"',
+            f'id-{regex_uuid4} = "{remote_id}"',
+            f'id-{regex_uuid4} = "{local_address}"',
+            f'id-{regex_uuid4} = "{peer_ip}"',
+            f'secret = "{secret}"',
+            f'ppk-{connection_name}',
+            f'id-{regex_uuid4} = "ppk-test"',
+            f'secret = 0x{ppk_secret_hex}',
+        ]
+        for line in swanctl_secrets_lines:
+            self.assertRegex(swanctl_conf, fr'{line}')
+
 
     def test_dmvpn(self):
         ike_lifetime = '3600'
@@ -826,6 +960,77 @@ class TestVPNIPsec(VyOSUnitTestSHIM.TestCase):
 
         # Disable PKI
         self.tearDownPKI()
+
+    def test_site_to_site_ikev2_reauth(self):
+        # T7555: Verify ikev2-reauth is correctly written to swanctl.conf
+        # and that invalid combinations are rejected by validation
+
+        local_address = '192.0.2.10'
+        ike_lifetime = '1800'
+
+        # Base PSK auth used across all sub-tests
+        psk_base_path = base_path + ['authentication', 'psk', connection_name]
+        self.cli_set(psk_base_path + ['id', local_id])
+        self.cli_set(psk_base_path + ['id', remote_id])
+        self.cli_set(psk_base_path + ['id', local_address])
+        self.cli_set(psk_base_path + ['id', peer_ip])
+        self.cli_set(psk_base_path + ['secret', secret])
+
+        peer_base_path = base_path + ['site-to-site', 'peer', connection_name]
+        self.cli_set(peer_base_path + ['authentication', 'mode', 'pre-shared-secret'])
+        self.cli_set(peer_base_path + ['default-esp-group', esp_group])
+        self.cli_set(peer_base_path + ['local-address', local_address])
+        self.cli_set(peer_base_path + ['remote-address', peer_ip])
+        self.cli_set(
+            peer_base_path + ['tunnel', '1', 'local', 'prefix', '10.0.0.0/24'],
+        )
+        self.cli_set(
+            peer_base_path + ['tunnel', '1', 'remote', 'prefix', '10.1.0.0/24'],
+        )
+
+        # ikev2-reauth on an IKEv1-only ike-group must be rejected
+        self.cli_set(base_path + ['ike-group', ike_group, 'key-exchange', 'ikev1'])
+        self.cli_set(base_path + ['ike-group', ike_group, 'lifetime', ike_lifetime])
+        self.cli_set(peer_base_path + ['ike-group', ike_group])
+        self.cli_set(peer_base_path + ['ikev2-reauth', 'yes'])
+
+        err_msg = 'ikev2-reauth requires key-exchange ikev2 in IKE group'
+        with self.assertRaisesRegex(ConfigSessionError, err_msg):
+            self.cli_commit()
+
+        # Switch to IKEv2, enable reauth on the ike-group (valueless flag)
+        self.cli_set(base_path + ['ike-group', ike_group, 'key-exchange', 'ikev2'])
+        self.cli_set(base_path + ['ike-group', ike_group, 'ikev2-reauth'])
+        self.cli_set(peer_base_path + ['ikev2-reauth', 'inherit'])
+        self.cli_commit()
+
+        swanctl_conf = read_file(swanctl_file)
+        self.assertIn(f'reauth_time = {ike_lifetime}s', swanctl_conf)
+
+        # ikev2-reauth = yes on peer overrides group
+        self.cli_delete(base_path + ['ike-group', ike_group, 'ikev2-reauth'])
+        self.cli_set(peer_base_path + ['ikev2-reauth', 'yes'])
+        self.cli_commit()
+
+        swanctl_conf = read_file(swanctl_file)
+        self.assertIn(f'reauth_time = {ike_lifetime}s', swanctl_conf)
+
+        # ikev2-reauth = no suppresses group flag
+        self.cli_set(base_path + ['ike-group', ike_group, 'ikev2-reauth'])
+        self.cli_set(peer_base_path + ['ikev2-reauth', 'no'])
+        self.cli_commit()
+
+        swanctl_conf = read_file(swanctl_file)
+        self.assertNotIn(f'reauth_time = {ike_lifetime}s', swanctl_conf)
+
+        # connection-type trap: reauth must be suppressed
+        self.cli_set(peer_base_path + ['connection-type', 'trap'])
+        self.cli_set(peer_base_path + ['ikev2-reauth', 'yes'])
+        self.cli_commit()
+
+        swanctl_conf = read_file(swanctl_file)
+        self.assertNotIn(f'reauth_time = {ike_lifetime}s', swanctl_conf)
+        self.assertIn('keyingtries = 1', swanctl_conf)
 
 
     def test_flex_vpn_vips(self):
@@ -1339,7 +1544,7 @@ class TestVPNIPsec(VyOSUnitTestSHIM.TestCase):
         self.tearDownPKI()
 
     def test_remote_access_no_rekey(self):
-        # In some RA secnarios, disabling server-initiated rekey of IKE and CHILD SA is desired
+        # In some RA scenarios, disabling server-initiated rekey of IKE and CHILD SA is desired
         self.setupPKI()
 
         ike_group = 'IKE-RW'
@@ -1748,7 +1953,7 @@ class TestVPNIPsec(VyOSUnitTestSHIM.TestCase):
         self.cli_commit()
 
         for config_option, cli_option in retransmission_options.items():
-            # Check configured value agains CLI default value
+            # Check configured value against CLI default value
             config_values_list = get_config_value(charon_file,config_option + ' =')
 
             if config_values_list:

@@ -273,9 +273,9 @@ class BridgeIf(Interface):
         return self.set_interface('vlan_protocol', map[protocol])
 
     def update(self, config):
-        """ General helper function which works on a dictionary retrived by
+        """ General helper function which works on a dictionary retrieved by
         get_config_dict(). It's main intention is to consolidate the scattered
-        interface setup code and provide a single point of entry when workin
+        interface setup code and provide a single point of entry when working
         on any interface. """
 
         # Set ageing time
@@ -385,6 +385,11 @@ class BridgeIf(Interface):
                 tmp = dict_search('root_guard', interface_config)
                 value = '1' if (tmp != None) else '0'
                 lower.set_root_guard(value)
+
+                # set learning
+                disable_learning = dict_search('disable_learning', interface_config)
+                value = '1' if disable_learning is None else '0'
+                lower.set_learning(value)
 
                 if 'enable_vlan' in config:
                     add_vlan = []

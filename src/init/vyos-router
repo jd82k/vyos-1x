@@ -164,6 +164,8 @@ init_bootfile () {
         else
             $vyos_libexec_dir/add-system-version.py > $BOOTFILE
         fi
+    fi
+    if [ -f $BOOTFILE ] ; then
         chgrp ${GROUP} $BOOTFILE
         chmod 660 $BOOTFILE
     fi
@@ -192,12 +194,17 @@ migrate_bootfile ()
 }
 
 # configure system-specific settings
-system_config ()
+system_activate ()
 {
     if [ -x $vyos_libexec_dir/run-config-activation.py ]; then
-        log_progress_msg system
+        log_progress_msg activate
         sg ${GROUP} -c "$vyos_libexec_dir/run-config-activation.py $BOOTFILE"
+        STATUS=$?
+        if [[ "$STATUS" != "0" ]]; then
+            return 1
+        fi
     fi
+    return 0
 }
 
 # load the initial config
@@ -308,6 +315,23 @@ bind_mount_boot ()
                     echo "Couldn't bind mount /boot/grub"
                 fi
             fi
+        fi
+    fi
+}
+
+# this is called before migration and bind_mount_slash_config to check for
+# upgrade data installed by legacy image update tools
+copy_legacy_config_path ()
+{
+    if [ -d /config ] ; then
+        if [ -f /config/.upgraded ] ; then
+            rm -f /config/.upgraded
+            cp -a /config /opt/vyatta/etc
+            chgrp -R vyattacfg /opt/vyatta/etc/config
+            chmod -R 775 /opt/vyatta/etc/config
+            chmod 660 /opt/vyatta/etc/config/config.boot
+            touch /opt/vyatta/etc/config/.vyatta_config
+            rm -rf /config
         fi
     fi
 }
@@ -471,7 +495,7 @@ start ()
     chmod 775 /var/run/vyatta /var/log/vyatta
 
     log_daemon_msg "Waiting for NICs to settle down"
-    # On boot time udev migth take a long time to reorder nic's, this will ensure that
+    # On boot time udev might take a long time to reorder nic's, this will ensure that
     # all udev activity is completed and all nics presented at boot-time will have their
     # final name before continuing with vyos-router initialization.
     SECONDS=0
@@ -578,6 +602,8 @@ start ()
     # This is a safety net!
     systemctl start frr.service
 
+    disabled copy_legacy_config_path || copy_legacy_config_path
+
     disabled bootfile || init_bootfile
 
     cleanup_post_commit_hooks
@@ -592,7 +618,7 @@ start ()
 
     update_interface_config || overall_status=1
 
-    disabled system_config || system_config || overall_status=1
+    disabled system_activate || system_activate || overall_status=1
 
     for s in ${subinit[@]} ; do
         if ! disabled $s; then
@@ -662,13 +688,18 @@ start ()
     fi
 
     # Start netplug daemon
-    systemctl start netplug.service
+    systemctl start vyos-netlinkd.service
 }
 
 stop()
 {
     local -i status=0
     log_daemon_msg "Stopping VyOS router"
+
+    # As vyos-netlinkd consumes a configuration, we need to stop it prior
+    # unmounting /config
+    systemctl stop vyos-netlinkd.service
+
     for ((i=${#sub_inits[@]} - 1; i >= 0; i--)) ; do
     s=${subinit[$i]}
     log_progress_msg $s
@@ -680,7 +711,6 @@ stop()
     umount ${vyatta_configdir}
     log_action_end_msg $?
 
-    systemctl stop netplug.service
     systemctl stop vyconfd.service
     systemctl stop frr.service
 

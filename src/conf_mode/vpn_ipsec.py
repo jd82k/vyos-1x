@@ -54,6 +54,7 @@ from vyos.utils.vti_updown_db import vti_updown_db_exists
 from vyos.utils.vti_updown_db import open_vti_updown_db_for_create_or_update
 from vyos.utils.vti_updown_db import remove_vti_updown_db
 from vyos import ConfigError
+from vyos.base import Warning
 from vyos import airbag
 airbag.enable()
 
@@ -65,6 +66,7 @@ charon_conf        = '/etc/strongswan.d/charon.conf'
 charon_dhcp_conf   = '/etc/strongswan.d/charon/dhcp.conf'
 charon_radius_conf = '/etc/strongswan.d/charon/eap-radius.conf'
 charon_systemd_conf = '/etc/strongswan.d/charon-systemd.conf'
+charon_logging_conf = '/etc/strongswan.d/charon-logging.conf'
 interface_conf     = '/etc/strongswan.d/interfaces_use.conf'
 swanctl_conf       = f'{swanctl_dir}/swanctl.conf'
 
@@ -189,7 +191,7 @@ def get_config(config=None):
         ipsec['l2tp_ike_default'] = 'aes256-sha1-modp1024,3des-sha1-modp1024'
         ipsec['l2tp_esp_default'] = 'aes256-sha1,3des-sha1'
 
-    # Collect the interface dicts for any refernced VTI interfaces in
+    # Collect the interface dicts for any referenced VTI interfaces in
     # case we need to bring the interface up
     ipsec['vti_interface_dicts'] = {}
 
@@ -261,11 +263,29 @@ def verify(ipsec):
     if not ipsec or 'deleted' in ipsec:
         return
 
+    # T8136 PPK support; keep a list of PPK IDs
+    ppk_ids = []
+
     if 'authentication' in ipsec:
         if 'psk' in ipsec['authentication']:
             for psk, psk_config in ipsec['authentication']['psk'].items():
                 if 'id' not in psk_config or 'secret' not in psk_config:
-                    raise ConfigError(f'Authentication psk "{psk}" missing "id" or "secret"')
+                    raise ConfigError(
+                        f'Authentication psk "{psk}" missing "id" or "secret"'
+                    )
+        # T8136 PPK Support; Check that PPK has an ID and secret defined, and ID is unique
+        if 'ppk' in ipsec['authentication']:
+            for ppk, ppk_config in ipsec['authentication']['ppk'].items():
+                if 'id' not in ppk_config:
+                    raise ConfigError(f'Authentication PPK "{ppk}" missing "id"')
+                if 'secret' not in ppk_config:
+                    raise ConfigError(f'Authentication PPK "{ppk}" missing "secret"')
+                for ppk_id in ppk_config['id']:
+                    if ppk_id in ppk_ids:
+                        raise ConfigError(
+                            f'Authentication PPK "{ppk}" has duplicate ID "{ppk_id}" from another PPK. IDs should be unique.'
+                        )
+                    ppk_ids.append(ppk_id)
 
     if 'interface' in ipsec:
         tmp = re.compile(dynamic_interface_pattern)
@@ -444,6 +464,25 @@ def verify(ipsec):
 
                         elif 'pool' not in ipsec['remote_access'] or pool not in ipsec['remote_access']['pool']:
                             raise ConfigError(f'Requested pool "{pool}" does not exist!')
+
+                # T8136 IPSEC PPK Support
+                # PPKs and Childless only works with IKEv2. Check that ike-group is v2 if either option is enabled. Check that PPK ID was actually defined in authentication. Recommend use of childless when using PPKs if not already configured.
+                if 'ppk' in ra_conf['authentication']:
+                    ike = ra_conf['ike_group']
+                    if dict_search(f'ike_group.{ike}.key_exchange', ipsec) != 'ikev2':
+                        raise ConfigError(
+                            f'Incorrect configuration in IKE group "{ike}": post-quantum pre-shared keys require explicit IKEv2 usage.'
+                        )
+                    if 'childless' not in ra_conf:
+                        Warning(
+                            'It is recommended to use childless IKE SAs when using PPKs'
+                        )
+                if 'childless' in ra_conf:
+                    ike = ra_conf['ike_group']
+                    if dict_search(f'ike_group.{ike}.key_exchange', ipsec) != 'ikev2':
+                        raise ConfigError(
+                            f'Incorrect configuration in IKE group "{ike}": childless IKE SAs can only be used with IKEv2.'
+                        )
 
         if 'pool' in ipsec['remote_access']:
             pool_networks = []
@@ -653,6 +692,41 @@ def verify(ipsec):
                                     f'for ESP proposal {proposal} on tunnel {tunnel} for site-to-site peer {peer} with VPP'
                                 )
 
+            # T8136 IPSEC PPK Support
+            # PPKs and Childless only works with IKEv2. Check that ike-group is v2 if either option is enabled. Check that PPK ID was actually defined in authentication. Recommend use of childless when using PPKs if not already configured.
+            if 'ppk' in peer_conf['authentication']:
+                ike = peer_conf['ike_group']
+                if dict_search(f'ike_group.{ike}.key_exchange', ipsec) != 'ikev2':
+                    raise ConfigError(
+                        f'Post-quantum preshared keys must be used with IKEv2! Please configure IKEv2 key-exchange in ike-group "{ike}".'
+                    )
+                if 'childless' not in peer_conf:
+                    Warning(
+                        'It is recommended to use childless IKE SAs when using PPKs'
+                    )
+            if 'childless' in peer_conf:
+                ike = peer_conf['ike_group']
+                if dict_search(f'ike_group.{ike}.key_exchange', ipsec) != 'ikev2':
+                    raise ConfigError(
+                        f'Childless IKE SAs be used with IKEv2! Please configure IKEv2 key-exchange in ike-group "{ike}".'
+                    )
+
+            # Get the referenced IKE group config
+            ike_group_name = peer_conf.get('ike_group')
+            ike_group = ipsec['ike_group'].get(ike_group_name, {})
+
+            # 'ikev2-reauth' only valid for IKEv2
+            peer_reauth = peer_conf.get('ikev2_reauth')
+            reauth_ike_group_configured = (
+                peer_reauth == 'inherit' and 'ikev2_reauth' in ike_group
+            )
+            if peer_reauth == 'yes' or reauth_ike_group_configured:
+                if ike_group.get('key_exchange') != 'ikev2':
+                    raise ConfigError(
+                        'ikev2-reauth requires key-exchange ikev2 in IKE group! '
+                        f'Please configure IKEv2 key-exchange in ike-group "{ike_group_name}".'
+                    )
+
 
 def cleanup_pki_files():
     for path in [CERT_PATH, CA_PATH, CRL_PATH, KEY_PATH, PUBKEY_PATH]:
@@ -710,7 +784,15 @@ def generate(ipsec):
     cleanup_pki_files()
 
     if not ipsec or 'deleted' in ipsec:
-        for config_file in [charon_dhcp_conf, charon_radius_conf, interface_conf, swanctl_conf]:
+        delete_files = (
+            charon_dhcp_conf,
+            charon_radius_conf,
+            charon_systemd_conf,
+            charon_logging_conf,
+            interface_conf,
+            swanctl_conf,
+        )
+        for config_file in delete_files:
             if os.path.isfile(config_file):
                 os.unlink(config_file)
         render(charon_conf, 'ipsec/charon.j2', {'install_routes': default_install_routes})
@@ -809,6 +891,7 @@ def generate(ipsec):
     render(charon_dhcp_conf, 'ipsec/charon/dhcp.conf.j2', ipsec)
     render(charon_radius_conf, 'ipsec/charon/eap-radius.conf.j2', ipsec)
     render(charon_systemd_conf, 'ipsec/charon_systemd.conf.j2', ipsec)
+    render(charon_logging_conf, 'ipsec/charon_logging.conf.j2', ipsec)
     render(interface_conf, 'ipsec/interfaces_use.conf.j2', ipsec)
     render(swanctl_conf, 'ipsec/swanctl.conf.j2', ipsec)
 

@@ -22,8 +22,8 @@ from glob import glob
 from sys import exit
 from vyos.base import Warning
 from vyos.config import Config
-from vyos.configdict import is_node_changed, node_changed
-from vyos.configdiff import Diff
+from vyos.configdict import is_node_changed
+from vyos.configdiff import Diff, get_config_diff
 from vyos.configdep import set_dependents, call_dependents
 from vyos.configverify import verify_interface_exists
 from vyos.ethtool import Ethtool
@@ -92,17 +92,12 @@ def geoip_sets(firewall):
     return out
 
 def geoip_updated(conf):
-    changes = node_changed(conf, ['firewall'],
-                                 key_mangling=('-', '_'),
-                                 recursive=True,
-                                 expand_nodes=Diff.ADD | Diff.DELETE)
-    updated = False
-
-    for _, path in dict_search_recursive(changes, 'geoip'):
-        updated = True
-        break
-
-    return updated
+    D = get_config_diff(conf, key_mangling=('-', '_'))
+    diff = D.get_child_nodes_diff(['firewall'],
+                                  expand_nodes=Diff.ADD | Diff.DELETE,
+                                  recursive=True)
+    return any(any(dict_search_recursive(diff.get(section, {}), 'geoip'))
+               for section in ('add', 'delete'))
 
 def get_config(config=None):
     if config:
@@ -124,6 +119,9 @@ def get_config(config=None):
 
     firewall['geoip_sets'] = geoip_sets(firewall)
     firewall['geoip_updated'] = geoip_updated(conf)
+    firewall['policy'] = conf.get_config_dict(
+        ['policy'], key_mangling=('-', '_'),
+        get_first_key=True, no_tag_node_value_mangle=True)
 
     fqdn_config_parse(firewall, 'firewall')
 
@@ -249,6 +247,8 @@ def verify_rule(firewall, family, hook, priority, rule_id, rule_conf):
 
         if not dict_search_args(firewall, 'flowtable', offload_target):
             raise ConfigError(f'Invalid offload-target. Flowtable "{offload_target}" does not exist on the system')
+    elif 'offload_target' in rule_conf:
+        Warning('offload-target is specified but action is not set to "offload"')
 
     if rule_conf['action'] != 'synproxy' and 'synproxy' in rule_conf:
         raise ConfigError('"synproxy" option allowed only for action synproxy')
@@ -532,6 +532,9 @@ def verify(firewall):
                 if 'url' not in group:
                     raise ConfigError(f'remote-group {group_name} must have a url configured')
 
+    offload_chains_v4 = set()
+    offload_chains_v6 = set()
+
     for family in ['ipv4', 'ipv6', 'bridge']:
         if family in firewall:
             for chain in ['name','forward','input','output', 'prerouting']:
@@ -550,6 +553,12 @@ def verify(firewall):
                         if 'rule' in priority_conf:
                             for rule_id, rule_conf in priority_conf['rule'].items():
                                 verify_rule(firewall, family, chain, priority, rule_id, rule_conf)
+
+                                if chain == 'name' and rule_conf['action'] == 'offload':
+                                    if family == 'ipv4':
+                                        offload_chains_v4.add(priority)
+                                    elif family == 'ipv6':
+                                        offload_chains_v6.add(priority)
 
     local_zone = False
     zone_interfaces = []
@@ -624,6 +633,11 @@ def verify(firewall):
                     if v6_name and not dict_search_args(firewall, 'ipv6', 'name', v6_name):
                         raise ConfigError(f'Firewall ipv6-name "{v6_name}" does not exist')
 
+                    if 'local_zone' in zone_conf or 'local_zone' in firewall['zone'][from_zone]:
+                        if (v4_name and v4_name in offload_chains_v4) or \
+                            (v6_name and v6_name in offload_chains_v6):
+                            raise ConfigError('Cannot use a firewall chain with offloading on local zone')
+
             if 'default_firewall' in zone_conf:
                 v4_name = dict_search_args(zone_conf, 'default_firewall', 'name')
                 if v4_name and not dict_search_args(firewall, 'ipv4', 'name', v4_name):
@@ -635,6 +649,10 @@ def verify(firewall):
 
                 if not v4_name and not v6_name:
                     raise ConfigError('No firewall names specified for default-firewall')
+
+                if (v4_name and v4_name in offload_chains_v4) or \
+                    (v6_name and v6_name in offload_chains_v6):
+                    raise ConfigError('Cannot use a chain with offloading for zone default-firewall')
 
     return None
 
@@ -719,12 +737,10 @@ def apply(firewall):
             domain_action = 'stop'
     call(f'systemctl {domain_action} vyos-domain-resolver.service')
 
-    if firewall['geoip_sets']:
-        # Call helper script to Update set contents
-        if 'name' in firewall['geoip_sets'] or 'ipv6_name' in firewall['geoip_sets']:
-            if firewall['geoip_updated'] or not geoip_refresh():
-                print('Updating GeoIP. Please wait...')
-                geoip_update(firewall)
+    if firewall['geoip_sets']['name'] or firewall['geoip_sets']['ipv6_name']:
+        if firewall['geoip_updated'] or not geoip_refresh():
+            print('Updating GeoIP. Please wait...')
+            geoip_update(firewall=firewall, policy=firewall['policy'])
 
     return None
 

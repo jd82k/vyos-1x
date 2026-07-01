@@ -25,8 +25,10 @@ from vyos.configdict import node_changed
 from vyos.config import Config
 from vyos.utils.network import get_protocol_by_name
 
+from vyos.vpp.utils import cli_ethernet_with_vifs_ifaces
 from vyos.vpp.utils import cli_ifaces_list
 from vyos.vpp.acl import Acl
+from vyos.vpp.config_verify import verify_vpp_interface_not_a_member
 
 
 # TCP flag names to bit values
@@ -90,8 +92,8 @@ def create_ip_rules_list(rules):
         }
 
         tcp_flags = rule.get('tcp_flags', {})
-        set_flags = [flag for flag in tcp_flags if flag != 'not']
-        unet_flags = list(tcp_flags.get('not', {}).keys())
+        set_flags = tcp_flags.get('is_set', [])
+        unet_flags = tcp_flags.get('is_not_set', [])
         tcp_mask, tcp_value = get_tcp_mask_value(set_flags, unet_flags)
         r['tcp_flags_mask'] = tcp_mask
         r['tcp_flags_value'] = tcp_value
@@ -115,7 +117,7 @@ def create_ip_rules_list(rules):
     return rules_list
 
 
-def create_macip_rules_list(rules):
+def create_mac_rules_list(rules):
     rules_list = []
     for rule in rules.values():
         r = {
@@ -171,9 +173,9 @@ def get_config(config=None) -> dict:
         expand_nodes=Diff.DELETE | Diff.ADD,
     )
 
-    changed_macip_ifaces = node_changed(
+    changed_mac_ifaces = node_changed(
         conf,
-        base + ['macip', 'interface'],
+        base + ['mac', 'interface'],
         key_mangling=('-', '_'),
         recursive=True,
         expand_nodes=Diff.DELETE | Diff.ADD,
@@ -182,13 +184,25 @@ def get_config(config=None) -> dict:
     config.update(
         {
             'changed_ip_ifaces': changed_ip_ifaces,
-            'changed_macip_ifaces': changed_macip_ifaces,
-            'vpp_ifaces': cli_ifaces_list(conf),
+            'changed_mac_ifaces': changed_mac_ifaces,
+            'vpp_ifaces': list(
+                dict.fromkeys(
+                    cli_ifaces_list(conf) + cli_ethernet_with_vifs_ifaces(conf)
+                )
+            ),
         }
     )
 
     if effective_config:
         config.update({'effective': effective_config})
+
+    # VPP interface membership data for member-conflict checks
+    config['interfaces_vpp'] = conf.get_config_dict(
+        ['interfaces', 'vpp'],
+        key_mangling=('-', '_'),
+        get_first_key=True,
+        no_tag_node_value_mangle=True,
+    )
 
     return config
 
@@ -197,7 +211,7 @@ def verify(config):
     if 'remove' in config or 'remove_vpp' in config:
         return None
 
-    for acl_type in ['ip', 'macip']:
+    for acl_type in ['ip', 'mac']:
         if acl_type in config:
             acl = config.get(acl_type)
             if 'tag_name' not in acl:
@@ -217,6 +231,7 @@ def verify(config):
                     raise ConfigError(
                         f'{iface} must be a VPP interface for ACL interface'
                     )
+                verify_vpp_interface_not_a_member(iface, config)
 
     if 'ip' in config:
         acl = config.get('ip')
@@ -262,17 +277,17 @@ def verify(config):
                             f'{err_msg} protocol must be tcp when specifying tcp flags'
                         )
 
-                    not_flags = rule_config.get('tcp_flags').get('not', [])
-                    if not_flags:
-                        duplicates = [
-                            flag
-                            for flag in rule_config.get('tcp_flags')
-                            if flag in not_flags
-                        ]
-                        if duplicates:
-                            raise ConfigError(
-                                f'{err_msg} cannot match a tcp flag as set and not set: {duplicates}'
-                            )
+                    tcp_flags = rule_config.get('tcp_flags', {})
+                    flags_set = tcp_flags.get('is_set', [])
+                    flags_not_set = tcp_flags.get('is_not_set', [])
+
+                    # same flag cannot be both set and not set
+                    conflict = [flag for flag in flags_set if flag in flags_not_set]
+                    if conflict:
+                        raise ConfigError(
+                            f'{err_msg} cannot match a TCP flag as both set and not set: '
+                            f'{", ".join(sorted(conflict))}'
+                        )
 
         for iface, iface_config in acl.get('interface', {}).items():
             if not any(key in iface_config for key in ('input', 'output')):
@@ -306,8 +321,8 @@ def verify(config):
                             )
                         used_names.append(name)
 
-    if 'macip' in config:
-        acl = config.get('macip')
+    if 'mac' in config:
+        acl = config.get('mac')
         for iface, iface_config in acl.get('interface', {}).items():
             if 'tag_name' not in iface_config:
                 raise ConfigError(f'"tag-name" is required for interface {iface}')
@@ -342,18 +357,18 @@ def apply(config):
                 if acl_name not in config.get('ip', {}).get('tag_name', {}):
                     acl.delete_acl(acl_name)
 
-        # Delete ACL macip
-        if 'macip' in config.get('effective'):
-            remove_config_macip = config.get('effective').get('macip')
+        # Delete ACL mac
+        if 'mac' in config.get('effective'):
+            remove_config_mac = config.get('effective').get('mac')
 
             # Delete ACL interfaces
-            for interface in config.get('changed_macip_ifaces'):
-                acl.delete_acl_macip_interface(interface)
+            for interface in config.get('changed_mac_ifaces'):
+                acl.delete_acl_mac_interface(interface)
 
-            # Delete ACL macip
-            for acl_name in remove_config_macip.get('tag_name'):
-                if acl_name not in config.get('macip', {}).get('tag_name', {}):
-                    acl.delete_acl_macip(acl_name)
+            # Delete ACL mac
+            for acl_name in remove_config_mac.get('tag_name'):
+                if acl_name not in config.get('mac', {}).get('tag_name', {}):
+                    acl.delete_acl_mac(acl_name)
 
     if 'remove' in config:
         return None
@@ -377,16 +392,16 @@ def apply(config):
         ]
         acl.add_acl_interface(iface, input_tags, output_tags)
 
-    # Add or replace ACL macip
-    config_macip = config.get('macip', {})
-    for acl_name in config_macip.get('tag_name', {}):
-        rules = create_macip_rules_list(
-            config_macip.get('tag_name').get(acl_name).get('rule')
+    # Add or replace ACL mac
+    config_mac = config.get('mac', {})
+    for acl_name in config_mac.get('tag_name', {}):
+        rules = create_mac_rules_list(
+            config_mac.get('tag_name').get(acl_name).get('rule')
         )
-        acl.add_replace_acl_macip(acl_name, rules)
+        acl.add_replace_acl_mac(acl_name, rules)
 
-    for iface, iface_config in config_macip.get('interface', {}).items():
-        acl.add_acl_macip_interface(iface, iface_config.get('tag_name'))
+    for iface, iface_config in config_mac.get('interface', {}).items():
+        acl.add_acl_mac_interface(iface, iface_config.get('tag_name'))
 
 
 if __name__ == '__main__':

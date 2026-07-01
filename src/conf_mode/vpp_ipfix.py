@@ -20,6 +20,8 @@ from vyos.config import Config
 from vyos.vpp.ipfix import IPFIX
 from vyos.vpp.utils import cli_ifaces_list
 from vyos.vpp.utils import vpp_iface_name_transform
+from vyos.vpp.control_vpp import VPPControl
+from vyos.vpp.config_verify import verify_vpp_interface_not_a_member
 
 
 def get_config(config=None) -> dict:
@@ -59,6 +61,14 @@ def get_config(config=None) -> dict:
     # Add list of VPP interfaces to the config
     config.update({'vpp_ifaces': cli_ifaces_list(conf)})
 
+    # VPP interface membership data for member-conflict checks
+    config['interfaces_vpp'] = conf.get_config_dict(
+        ['interfaces', 'vpp'],
+        key_mangling=('-', '_'),
+        get_first_key=True,
+        no_tag_node_value_mangle=True,
+    )
+
     return config
 
 
@@ -73,11 +83,14 @@ def verify(config):
         )
 
     # Verify that all interfaces specified exist in VPP
+    vpp = VPPControl()
     for interface in config['interface']:
-        if interface not in config['vpp_ifaces']:
+        vpp_iface_name = vpp_iface_name_transform(interface)
+        if vpp.get_sw_if_index(vpp_iface_name) is None:
             raise ConfigError(
                 f'{interface} must be a VPP interface for IPFIX monitoring'
             )
+        verify_vpp_interface_not_a_member(interface, config)
 
     # Verify that at least one collector is configured
     if 'collector' not in config:

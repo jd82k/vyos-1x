@@ -78,9 +78,31 @@ otp_file = '/config/auth/openvpn/{ifname}-otp-secrets'
 secret_chars = list('ABCDEFGHIJKLMNOPQRSTUVWXYZ234567')
 service_file = '/run/systemd/system/openvpn@{ifname}.service.d/20-override.conf'
 
+def _only_client_config_changed(conf, base, ifname):
+    """
+    Return True when the sole diff under this interface is a change to
+    `server.client` entries (i.e. CCD files).
+    """
+
+    iface_path = base + [ifname]
+    diff = get_config_diff(conf)
+
+    def _has_only_changes(path, node):
+        changes = diff.node_changed_children(path)
+        return len(changes) == 1 and changes[0] == node
+
+    # Something outside of 'server' also changed - not a CCD-only change
+    if _has_only_changes(iface_path, 'server'):
+        # Something outside of 'server.client' also changed - not a CCD-only change
+        if _has_only_changes(iface_path + ['server'], 'client'):
+            return True
+
+    return False
+
+
 def get_config(config=None):
     """
-    Retrive CLI config as dictionary. Dictionary can never be empty, as at least the
+    Retrieve CLI config as dictionary. Dictionary can never be empty, as at least the
     interface name will be added or a deleted flag
     """
     if config:
@@ -116,6 +138,12 @@ def get_config(config=None):
         openvpn.update({'restart_required': {}})
     if is_node_changed(conf, base + [ifname, 'enable-dco']):
         openvpn.update({'restart_required': {}})
+
+    # Detect changes that are limited to per-client CCD entries (T6478).
+    # OpenVPN reads client-config-dir files at connect time, so adding or
+    # updating them requires neither a SIGHUP nor a service restart.
+    if 'restart_required' not in openvpn and openvpn['mode'] == 'server':
+        openvpn['client_only_changed'] = _only_client_config_changed(conf, base, ifname)
 
     # We have to get the dict using 'get_config_dict' instead of 'get_interface_dict'
     # as 'get_interface_dict' merges the defaults in, so we can not check for defaults in there.
@@ -366,6 +394,11 @@ def verify(openvpn):
 
         if dict_search('encryption.data_ciphers', openvpn):
             raise ConfigError('Cipher negotiation can only be used in client or server mode')
+
+        if not dict_search('encryption.cipher', openvpn) and \
+           not dict_search('encryption.data_ciphers_fallback', openvpn):
+            raise ConfigError('Must define "encryption cipher" or "encryption ' \
+                              'data-ciphers-fallback" for site-to-site encryption!')
 
     else:
         # checks for client-server or site-to-site bridged
@@ -742,7 +775,7 @@ def generate(openvpn):
     # create client config directory on demand
     makedir(ccd_dir, user, group)
 
-    # Fix file permissons for keys
+    # Fix file permissions for keys
     generate_pki_files(openvpn)
 
     # Generate User/Password authentication file
@@ -793,7 +826,7 @@ def apply(openvpn):
             VTunIf(interface).remove()
 
     # dynamically load/unload DCO Kernel extension if requested
-    dco_module = 'ovpn_dco_v2'
+    dco_module = 'ovpn'
     if 'module_load_dco' in openvpn:
         check_kmod(dco_module)
     else:
@@ -813,7 +846,7 @@ def apply(openvpn):
     # No matching OpenVPN process running - maybe it got killed or none
     # existed - nevertheless, spawn new OpenVPN process
 
-    if not openvpn.get('no_restart_crl'):
+    if not openvpn.get('no_restart_crl') and not openvpn.get('client_only_changed'):
         action = 'reload-or-restart'
         if 'restart_required' in openvpn:
             action = 'restart'

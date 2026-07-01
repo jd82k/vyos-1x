@@ -43,7 +43,6 @@ class EthernetInterfaceTest(BasicInterfaceTest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls._base_path = ['interfaces', 'ethernet']
-        cls._mirror_interfaces = ['dum21354']
 
         # We only test on physical interfaces and not VLAN (sub-)interfaces
         if 'TEST_ETH' in os.environ:
@@ -235,8 +234,8 @@ class EthernetInterfaceTest(BasicInterfaceTest.TestCase):
                 # To find out the supported features
                 supported_rx_usecs = ethtool.check_coalesce('rx_usecs')
                 supported_tx_usecs = ethtool.check_coalesce('tx_usecs')
-                supported_adaptive_rx = ethtool.check_coalesce('adaptive_rx')
-                supported_adaptive_tx = ethtool.check_coalesce('adaptive_tx')
+                supported_adaptive_rx = ethtool.check_coalesce('adaptive_rx') and not is_virtio
+                supported_adaptive_tx = ethtool.check_coalesce('adaptive_tx') and not is_virtio
 
                 # Disabled adaptive modes and set custom values
                 if supported_rx_usecs:

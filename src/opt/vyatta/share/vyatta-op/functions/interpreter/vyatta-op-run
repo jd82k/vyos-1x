@@ -20,7 +20,7 @@
 
 _vyatta_op_init ()
 {
-    # empty and default line compeletion
+    # empty and default line completion
     complete -E -F _vyatta_op_expand
     complete -D -F _vyatta_op_default_expand
 
@@ -100,7 +100,7 @@ _vyatta_op_conv_node_path ()
 
 _vyatta_op_conv_run_cmd ()
 {
-  # Substitue bash positional variables 
+  # Substitute bash positional variables 
   # for the same value in the expanded array
   local restore_shopts=$( shopt -p extglob nullglob | tr \\n \; )
   shopt -s extglob
@@ -169,9 +169,18 @@ _vyatta_op_run ()
 
     _vyatta_op_last_comp=${_vyatta_op_last_comp_init}
     false; estat=$?
-    stty echo 2> /dev/null # turn echo on, this is a workaround for bug 7570
-                           # not a fix we need to look at why the readline library 
-                           # is getting confused on paged help text.
+
+    # Only touch terminal settings when `stdout` is a real TTY.
+    # When output is piped (e.g. via `sudo ... | cat`), running `stty` can interfere
+    # with non-interactive execution and produce corrupted/indented output.
+    if [ -t 1 ]; then
+
+      # Turn echo on, this is a workaround for bug 7570
+      # not a fix we need to look at why the readline library
+      # is getting confused on paged help text.
+      stty echo 2> /dev/null
+
+    fi
 
     i=1
     declare -a args  # array of expanded arguments

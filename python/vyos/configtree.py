@@ -18,6 +18,12 @@ import json
 import logging
 
 from ctypes import cdll, c_char_p, c_void_p, c_int, c_bool
+from typing import TYPE_CHECKING
+
+# https://peps.python.org/pep-0484/#forward-references
+# for type 'ConfigDict'
+if TYPE_CHECKING:
+    from vyos.referencetree import ReferenceTree
 
 BUILD_PATH = '/tmp/libvyosconfig/_build/libvyosconfig.so'
 INSTALL_PATH = '/usr/lib/libvyosconfig.so.0'
@@ -67,11 +73,21 @@ class ConfigTreeError(Exception):
 
 class ConfigTree(object):
     def __init__(
-        self, config_string=None, address=None, internal=None, libpath=LIBPATH
+        self,
+        config_string=None,
+        address=None,
+        internal=None,
+        internal_string=None,
+        libpath=LIBPATH,
     ):
-        if config_string is None and address is None and internal is None:
+        if (
+            config_string is None
+            and address is None
+            and internal is None
+            and internal_string is None
+        ):
             raise TypeError(
-                "ConfigTree() requires one of 'config_string', 'address', or 'internal'"
+                "ConfigTree() requires one of 'config_string', 'address', 'internal', or 'internal_string'"
             )
 
         self.__config = None
@@ -100,6 +116,14 @@ class ConfigTree(object):
 
         self.__write_internal = self.__lib.write_internal
         self.__write_internal.argtypes = [c_void_p, c_char_p]
+
+        self.__read_internal_string = self.__lib.read_internal_string
+        self.__read_internal_string.argtypes = [c_char_p]
+        self.__read_internal_string.restype = c_void_p
+
+        self.__write_internal_string = self.__lib.write_internal_string
+        self.__write_internal_string.argtypes = [c_void_p]
+        self.__write_internal_string.restype = c_char_p
 
         self.__to_json = self.__lib.to_json
         self.__to_json.argtypes = [c_void_p]
@@ -188,6 +212,17 @@ class ConfigTree(object):
         self.__equal.argtypes = [c_void_p, c_void_p]
         self.__equal.restype = c_bool
 
+        self.__config_dict = self.__lib.config_dict
+        self.__config_dict.argtypes = [
+            c_void_p,
+            c_void_p,
+            c_void_p,
+            c_char_p,
+            c_bool,
+            c_bool,
+        ]
+        self.__config_dict.restype = c_char_p
+
         if address is not None:
             self.__config = address
             self.__version = ''
@@ -195,7 +230,19 @@ class ConfigTree(object):
             config = self.__read_internal(internal.encode())
             if config is None:
                 msg = self.__get_error().decode()
-                raise ValueError('Failed to read internal rep: {0}'.format(msg))
+                raise ValueError(
+                    f'Failed to read internal representation from file {internal}: {msg}'
+                )
+            else:
+                self.__config = config
+                self.__version = ''
+        elif internal_string is not None:
+            config = self.__read_internal_string(internal_string.encode())
+            if config is None:
+                msg = self.__get_error().decode()
+                raise ValueError(
+                    f'Failed to read internal representation from string: {msg}'
+                )
             else:
                 self.__config = config
                 self.__version = ''
@@ -205,7 +252,7 @@ class ConfigTree(object):
             config = self.__from_string(config_section.encode())
             if config is None:
                 msg = self.__get_error().decode()
-                raise ValueError('Failed to parse config: {0}'.format(msg))
+                raise ValueError(f'Failed to parse config: {msg}')
             else:
                 self.__config = config
                 self.__version = version_section
@@ -224,20 +271,24 @@ class ConfigTree(object):
 
     def __eq__(self, other):
         if isinstance(other, ConfigTree):
-            return self.__equal(self._get_config(), other._get_config())
+            return self.__equal(self.get_tree(), other.get_tree())
         return False
 
     def __str__(self):
         return self.to_string()
 
-    def _get_config(self):
+    def get_tree(self):
         return self.__config
 
     def get_version_string(self):
         return self.__version
 
     def write_cache(self, file_name):
-        self.__write_internal(self._get_config(), file_name.encode())
+        self.__write_internal(self.get_tree(), file_name.encode())
+
+    def write_internal_string(self) -> str:
+        res = self.__write_internal_string(self.get_tree())
+        return res.decode()
 
     def to_string(self, ordered_values=False, no_version=False):
         config_string = self.__to_string(self.__config, ordered_values).decode()
@@ -271,8 +322,8 @@ class ConfigTree(object):
         """Set new entry in VyOS configuration.
         path: configuration path e.g. 'system dns forwarding listen-address'
         value: value to be added to node, e.g. '172.18.254.201'
-        replace: True: current occurance will be replaced
-                 False: new value will be appended to current occurances - use
+        replace: True: current occurrence will be replaced
+                 False: new value will be appended to current occurrences - use
                  this for adding values to a multi node
         """
 
@@ -472,6 +523,23 @@ class ConfigTree(object):
         subt = ConfigTree(address=res)
         return subt
 
+    def config_dict(
+        self, ref_tree, path, mask, get_first_key=False, with_defaults=False
+    ):
+        check_path(path)
+        path_str = ' '.join(map(str, path)).encode()
+
+        res_json = self.__config_dict(
+            self.__config,
+            ref_tree.get_tree(),
+            mask.get_tree(),
+            path_str,
+            get_first_key,
+            with_defaults,
+        ).decode()
+        res = json.loads(res_json)
+        return res
+
 
 def diff_compare(left, right, path=[], commands=False, libpath=LIBPATH):
     if left is None:
@@ -495,7 +563,7 @@ def diff_compare(left, right, path=[], commands=False, libpath=LIBPATH):
     __get_error.argtypes = []
     __get_error.restype = c_char_p
 
-    res = __diff_compare(commands, path_str, left._get_config(), right._get_config())
+    res = __diff_compare(commands, path_str, left.get_tree(), right.get_tree())
     res = res.decode()
     if res == '#1@':
         msg = __get_error().decode()
@@ -521,7 +589,7 @@ def union(left, right, libpath=LIBPATH):
     __get_error.argtypes = []
     __get_error.restype = c_char_p
 
-    res = __tree_union(left._get_config(), right._get_config())
+    res = __tree_union(left.get_tree(), right.get_tree())
     tree = ConfigTree(address=res)
 
     return tree
@@ -543,7 +611,7 @@ def merge(left, right, destructive=False, libpath=LIBPATH):
     __get_error.argtypes = []
     __get_error.restype = c_char_p
 
-    res = __tree_merge(destructive, left._get_config(), right._get_config())
+    res = __tree_merge(destructive, left.get_tree(), right.get_tree())
     tree = ConfigTree(address=res)
 
     return tree
@@ -556,13 +624,102 @@ def mask_inclusive(left, right, libpath=LIBPATH):
     try:
         __lib = cdll.LoadLibrary(libpath)
         __mask_tree = __lib.mask_tree
-        __mask_tree.argtypes = [c_void_p, c_void_p]
+        __mask_tree.argtypes = [c_void_p, c_void_p, c_bool]
         __mask_tree.restype = c_void_p
         __get_error = __lib.get_error
         __get_error.argtypes = []
         __get_error.restype = c_char_p
 
-        res = __mask_tree(left._get_config(), right._get_config())
+        res = __mask_tree(left.get_tree(), right.get_tree(), False)
+    except Exception as e:
+        raise ConfigTreeError(e)
+    if not res:
+        msg = __get_error().decode()
+        raise ConfigTreeError(msg)
+
+    tree = ConfigTree(address=res)
+
+    return tree
+
+
+def mask_exclusive(left, right, libpath=LIBPATH):
+    if not (isinstance(left, ConfigTree) and isinstance(right, ConfigTree)):
+        raise TypeError('Arguments must be instances of ConfigTree')
+
+    try:
+        __lib = cdll.LoadLibrary(libpath)
+        __mask_tree = __lib.mask_tree
+        __mask_tree.argtypes = [c_void_p, c_void_p, c_bool]
+        __mask_tree.restype = c_void_p
+        __get_error = __lib.get_error
+        __get_error.argtypes = []
+        __get_error.restype = c_char_p
+
+        res = __mask_tree(left.get_tree(), right.get_tree(), True)
+    except Exception as e:
+        raise ConfigTreeError(e)
+    if not res:
+        msg = __get_error().decode()
+        raise ConfigTreeError(msg)
+
+    tree = ConfigTree(address=res)
+
+    return tree
+
+
+def delete_tree_from_masks(
+    config_tree: ConfigTree, include_mask: ConfigTree, exclude_mask: ConfigTree
+):
+    masked_inc = mask_inclusive(config_tree, include_mask)
+    # Here we want the reversed stand-alone exclusion/inclusion.
+    # This simplifies definition of delete paths as (delete)
+    # difference between the two trees of config data.
+    masked_upper_bound = mask_exclusive(config_tree, include_mask)
+    masked_lower_bound = mask_inclusive(config_tree, exclude_mask)
+    masked_exc = union(masked_upper_bound, masked_lower_bound)
+
+    ret = DiffTree(masked_inc, masked_exc)
+    return ret.delete
+
+
+def delete_dict_from_masks(
+    config_tree: ConfigTree, include_mask: ConfigTree, exclude_mask: ConfigTree
+):
+    ret = delete_tree_from_masks(config_tree, include_mask, exclude_mask)
+    return json.loads(ret.to_json())
+
+
+def subtree_from_partial(
+    config_tree: ConfigTree,
+    path: list[str],
+    reference_tree: 'ReferenceTree',
+    start: ConfigTree = None,
+    libpath=LIBPATH,
+):
+    if start:
+        if not isinstance(start, ConfigTree):
+            raise TypeError("Argument 'start' must be an instance of ConfigTree")
+    else:
+        start = ConfigTree('')
+
+    check_path(path)
+    path_str = ' '.join(map(str, path)).encode()
+
+    try:
+        __lib = cdll.LoadLibrary(libpath)
+        __subtree_from_partial = __lib.subtree_from_partial
+        __subtree_from_partial.argtypes = [c_void_p, c_void_p, c_void_p, c_char_p]
+        __subtree_from_partial.restype = c_void_p
+        __get_error = __lib.get_error
+        __get_error.argtypes = []
+        __get_error.restype = c_char_p
+
+        res = __subtree_from_partial(
+            reference_tree.get_tree(),
+            config_tree.get_tree(),
+            start.get_tree(),
+            path_str,
+        )
     except Exception as e:
         raise ConfigTreeError(e)
     if not res:
@@ -657,7 +814,7 @@ def validate_tree_filter(
         __get_error.argtypes = []
         __get_error.restype = c_char_p
         res = __validate_tree_filter(
-            config_tree._get_config(), cache_path.encode(), validator_dir.encode()
+            config_tree.get_tree(), cache_path.encode(), validator_dir.encode()
         )
     except Exception as e:
         raise ConfigTreeError(e)
@@ -706,7 +863,7 @@ class DiffTree:
         check_path(path)
         path_str = ' '.join(map(str, path)).encode()
 
-        res = self.__diff_tree(path_str, left._get_config(), right._get_config())
+        res = self.__diff_tree(path_str, left.get_tree(), right.get_tree())
 
         # full diff config_tree and python dict representation
         self.full = ConfigTree(address=res)

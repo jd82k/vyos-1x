@@ -18,6 +18,7 @@
 # pylint: disable=wildcard-import,unused-wildcard-import
 # pylint: disable=broad-exception-caught
 
+import asyncio
 import json
 import copy
 import logging
@@ -85,6 +86,7 @@ LOG = logging.getLogger('http_api.routers')
 
 lock = Lock()
 
+asynclock = asyncio.Lock()
 
 def check_auth(key_list, key):
     key_id = None
@@ -105,7 +107,7 @@ def auth_required(data: ApiModel):
 
 
 # override Request and APIRoute classes in order to convert form request to json;
-# do all explicit validation here, for backwards compatability of error messages;
+# do all explicit validation here, for backwards compatibility of error messages;
 # the explicit validation may be dropped, if desired, in favor of native
 # validation by FastAPI/Pydantic, as is used for application/json requests
 class MultipartRequest(Request):
@@ -419,8 +421,8 @@ def _execute_configure_op(
                 section = c.section
 
             elif isinstance(c, BaseConfigSectionTreeModel):
-                mask = c.mask
-                config = c.config
+                mask_dict = c.mask
+                config_dict = c.config
 
             if isinstance(c, BaseConfigureModel):
                 if op == 'set':
@@ -446,9 +448,10 @@ def _execute_configure_op(
 
             elif isinstance(c, BaseConfigSectionTreeModel):
                 if op == 'set':
-                    session.set_section_tree(config)
+                    session.set_section_tree(config_dict)
                 elif op == 'load':
-                    session.load_section_tree(mask, config)
+                    config_tree = config.get_config_tree()
+                    session.load_section_tree(config_tree, mask_dict, config_dict)
                 else:
                     raise op_error
         # end for
@@ -499,7 +502,7 @@ def _execute_configure_op(
         status = 500
 
         # Don't give the details away to the outer world
-        error_msg = 'An internal error occured. Check the logs for details.'
+        error_msg = 'An internal error occurred. Check the logs for details.'
     finally:
         if 'IN_COMMIT_CONFIRM' in env:
             del env['IN_COMMIT_CONFIRM']
@@ -629,7 +632,7 @@ async def retrieve_op(data: RetrieveModel):
         return error(400, str(e))
     except Exception:
         LOG.critical(traceback.format_exc())
-        return error(500, 'An internal error occured. Check the logs for details.')
+        return error(500, 'An internal error occurred. Check the logs for details.')
 
     return success(res)
 
@@ -664,68 +667,63 @@ async def config_file_op(data: ConfigFileModel, background_tasks: BackgroundTask
     # A non-zero confirm_time will start commit-confirm timer on commit
     confirm_time = data.confirm_time
 
-    lock.acquire()
+    # Serialize config operations without blocking the event loop
+    async with asynclock:
+        try:
+            if op == 'save':
+                path = data.file or '/config/config.boot'
+                msg = session.save_config(path)
 
-    try:
-        if op == 'save':
-            if data.file:
-                path = data.file
-            else:
-                path = '/config/config.boot'
-            msg = session.save_config(path)
-        elif op in ('load', 'merge'):
-            if data.file:
-                path = data.file
-            elif data.string:
-                path = '/tmp/config.file'
-                with open(path, 'w') as f:
-                    f.write(data.string)
-            else:
-                return error(400, 'Missing required field "file | string"')
+            elif op in ('load', 'merge'):
+                if data.file:
+                    path = data.file
+                elif data.string:
+                    path = '/tmp/config.file'
+                    with open(path, 'w') as f:
+                        f.write(data.string)
+                else:
+                    return error(400, 'Missing required field "file | string"')
 
-            match op:
-                case 'load':
-                    session.migrate_and_load_config(path)
-                case 'merge':
-                    session.merge_config(path, destructive=data.destructive)
+                match op:
+                    case 'load':
+                        session.migrate_and_load_config(path)
+                    case 'merge':
+                        session.merge_config(path, destructive=data.destructive)
 
-            config = Config(session_env=env)
-            d = get_config_diff(config)
+                config = Config(session_env=env)
+                d = get_config_diff(config)
 
-            state.confirm_time = confirm_time if confirm_time else 0
+                state.confirm_time = confirm_time if confirm_time else 0
 
-            if not d.is_node_changed(['service', 'https']):
-                if confirm_time:
-                    out, err = await run_in_threadpool(run_commit_confirm, state)
+                if not d.is_node_changed(['service', 'https']):
+                    if confirm_time:
+                        out, err = await run_in_threadpool(run_commit_confirm, state)
+                    else:
+                        out, err = await run_in_threadpool(run_commit, state)
+
                     if err:
                         raise err
-                    msg = msg + out if msg else out
+                    msg = (msg or '') + (out or '')
                 else:
-                    out, err = await run_in_threadpool(run_commit, state)
-                    if err:
-                        raise err
-                    msg = msg + out if msg else out
+                    if confirm_time:
+                        background_tasks.add_task(call_commit_confirm, state)
+                    else:
+                        background_tasks.add_task(call_commit, state)
+                    out = self_ref_msg
+                    msg = (msg or '') + (out or '')
+            elif op == 'confirm':
+                msg = session.confirm()
             else:
-                if confirm_time:
-                    background_tasks.add_task(call_commit_confirm, state)
-                else:
-                    background_tasks.add_task(call_commit, state)
-                out = self_ref_msg
-                msg = msg + out if msg else out
+                return error(400, f"'{op}' is not a valid operation")
 
-        elif op == 'confirm':
-            msg = session.confirm()
-        else:
-            return error(400, f"'{op}' is not a valid operation")
-    except ConfigSessionError as e:
-        return error(400, str(e))
-    except Exception:
-        LOG.critical(traceback.format_exc())
-        return error(500, 'An internal error occured. Check the logs for details.')
-    finally:
-        if 'IN_COMMIT_CONFIRM' in env:
-            del env['IN_COMMIT_CONFIRM']
-        lock.release()
+        except ConfigSessionError as e:
+            return error(400, str(e))
+        except Exception:
+            LOG.critical(traceback.format_exc())
+            return error(500, 'An internal error occurred. Check the logs for details.')
+        finally:
+            if 'IN_COMMIT_CONFIRM' in env:
+                del env['IN_COMMIT_CONFIRM']
 
     return success(msg)
 
@@ -750,7 +748,7 @@ def image_op(data: ImageModel):
         return error(400, str(e))
     except Exception:
         LOG.critical(traceback.format_exc())
-        return error(500, 'An internal error occured. Check the logs for details.')
+        return error(500, 'An internal error occurred. Check the logs for details.')
 
     return success(res)
 
@@ -783,7 +781,7 @@ def container_image_op(data: ContainerImageModel):
         return error(400, str(e))
     except Exception:
         LOG.critical(traceback.format_exc())
-        return error(500, 'An internal error occured. Check the logs for details.')
+        return error(500, 'An internal error occurred. Check the logs for details.')
 
     return success(res)
 
@@ -806,7 +804,7 @@ def generate_op(data: GenerateModel):
         return error(400, str(e))
     except Exception:
         LOG.critical(traceback.format_exc())
-        return error(500, 'An internal error occured. Check the logs for details.')
+        return error(500, 'An internal error occurred. Check the logs for details.')
 
     return success(res)
 
@@ -828,7 +826,7 @@ def show_op(data: ShowModel):
         return error(400, str(e))
     except Exception:
         LOG.critical(traceback.format_exc())
-        return error(500, 'An internal error occured. Check the logs for details.')
+        return error(500, 'An internal error occurred. Check the logs for details.')
 
     return success(res)
 
@@ -850,7 +848,7 @@ def reboot_op(data: RebootModel):
         return error(400, str(e))
     except Exception:
         LOG.critical(traceback.format_exc())
-        return error(500, 'An internal error occured. Check the logs for details.')
+        return error(500, 'An internal error occurred. Check the logs for details.')
 
     return success(res)
 
@@ -871,7 +869,7 @@ def renew_op(data: RenewModel):
         return error(400, str(e))
     except Exception:
         LOG.critical(traceback.format_exc())
-        return error(500, 'An internal error occured. Check the logs for details.')
+        return error(500, 'An internal error occurred. Check the logs for details.')
 
     return success(res)
 
@@ -892,7 +890,7 @@ def reset_op(data: ResetModel):
         return error(400, str(e))
     except Exception:
         LOG.critical(traceback.format_exc())
-        return error(500, 'An internal error occured. Check the logs for details.')
+        return error(500, 'An internal error occurred. Check the logs for details.')
 
     return success(res)
 
@@ -932,7 +930,7 @@ def import_pki(data: ImportPkiModel):
         return error(400, str(e))
     except Exception:
         LOG.critical(traceback.format_exc())
-        return error(500, 'An internal error occured. Check the logs for details.')
+        return error(500, 'An internal error occurred. Check the logs for details.')
     finally:
         lock.release()
 
@@ -956,7 +954,7 @@ def poweroff_op(data: PoweroffModel):
         return error(400, str(e))
     except Exception:
         LOG.critical(traceback.format_exc())
-        return error(500, 'An internal error occured. Check the logs for details.')
+        return error(500, 'An internal error occurred. Check the logs for details.')
 
     return success(res)
 

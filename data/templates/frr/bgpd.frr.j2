@@ -34,6 +34,9 @@
 {%     if config.bfd.profile is vyos_defined %}
  neighbor {{ neighbor }} bfd profile {{ config.bfd.profile }}
 {%     endif %}
+{%     if config.bfd.strict is vyos_defined %}
+ neighbor {{ neighbor }} bfd strict {{ 'hold-time ' ~ config.bfd.strict.hold_time if config.bfd.strict.hold_time is vyos_defined else '' }}
+{%     endif %}
 {% endif %}
 {% if config.capability.dynamic is vyos_defined %}
  neighbor {{ neighbor }} capability dynamic
@@ -157,6 +160,8 @@
  address-family ipv6 flowspec
 {%         elif afi == 'l2vpn_evpn' %}
  address-family l2vpn evpn
+{%         elif afi == 'link_state' %}
+ address-family link-state
 {%         endif %}
 {%         if afi_config.addpath_tx_all is vyos_defined %}
   neighbor {{ neighbor }} addpath-tx-all-paths
@@ -259,7 +264,7 @@
 {# j2lint: disable=jinja-statements-delimeter #}
 {%- endmacro -%}
 !
-router bgp {{ system_as }} {{ 'vrf ' ~ vrf if vrf is vyos_defined }}
+router bgp {{ system_as }} {{ 'vrf ' ~ vrf if vrf is vyos_defined }} {{ 'as-notation ' ~ parameters.as_notation | replace('as', '') if parameters.as_notation is vyos_defined }}
 {% if parameters.ebgp_requires_policy is vyos_defined %}
  bgp ebgp-requires-policy
 {% else %}
@@ -666,6 +671,9 @@ bgp route-reflector allow-outbound-policy
 {% endif %}
 {% if parameters.tcp_keepalive.idle is vyos_defined and parameters.tcp_keepalive.interval is vyos_defined and parameters.tcp_keepalive.probes is vyos_defined %}
  bgp tcp-keepalive {{ parameters.tcp_keepalive.idle }} {{ parameters.tcp_keepalive.interval }} {{ parameters.tcp_keepalive.probes }}
+{% endif %}
+{% if parameters.update_delay.max_delay is vyos_defined %}
+ update-delay {{ parameters.update_delay.max_delay }}{{ ' ' ~ parameters.update_delay.establish_wait if parameters.update_delay.establish_wait is vyos_defined }}
 {% endif %}
 {% if srv6.locator is vyos_defined %}
  segment-routing srv6

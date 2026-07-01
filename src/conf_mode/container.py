@@ -130,7 +130,7 @@ def verify(container):
 
             # Check if requested container image exists locally. If it does not
             # exist locally - inform the user. This is required as there is a
-            # shared container image storage accross all VyOS images. A user can
+            # shared container image storage across all VyOS images. A user can
             # delete a container image from the system, boot into another version
             # of VyOS and then it would fail to boot. This is to prevent any
             # configuration error when container images are deleted from the
@@ -177,13 +177,13 @@ def verify(container):
                             try:
                                 network = [x for x in container['network'][network_name]['prefix'] if is_ipv4(x)][0]
                                 cnt_ipv4 += 1
-                            except:
+                            except Exception:
                                 raise ConfigError(f'Network "{network_name}" does not contain an IPv4 prefix!')
                         elif is_ipv6(address):
                             try:
                                 network = [x for x in container['network'][network_name]['prefix'] if is_ipv6(x)][0]
                                 cnt_ipv6 += 1
-                            except:
+                            except Exception:
                                 raise ConfigError(f'Network "{network_name}" does not contain an IPv6 prefix!')
 
                         # Specified container IP address must belong to network prefix
@@ -663,7 +663,7 @@ def apply(container):
 
             if run(f'podman image exists {image}') != 0:
                 # container image does not exist locally - user already got
-                # informed by a WARNING in verfiy() - bail out early
+                # informed by a WARNING in verify() - bail out early
                 continue
 
             if 'disable' in container_config:

@@ -555,7 +555,7 @@ def parse_rule(rule_conf, hook, fw_name, rule_id, ip_name):
                     timeout_value = side_conf['timeout']
                     output.append(f'set update ip{def_suffix} {prefix}addr timeout {timeout_value} @DA{def_suffix}_{dyn_group}')
                 else:
-                    output.append(f'set update ip{def_suffix} saddr @DA{def_suffix}_{dyn_group}')
+                    output.append(f'set update ip{def_suffix} {prefix}addr @DA{def_suffix}_{dyn_group}')
 
     set_table = False
     if 'set' in rule_conf:
@@ -662,6 +662,19 @@ def parse_tcp_flags(flags):
     exclude = list(flags['not']) if 'not' in flags else []
     return f'tcp flags & ({"|".join(include + exclude)}) == {"|".join(include) if include else "0x0"}'
 
+def expand_weekday(abbrev: str) -> str:
+    mapping = {
+        'mon': 'monday',
+        'tue': 'tuesday',
+        'wed': 'wednesday',
+        'thu': 'thursday',
+        'fri': 'friday',
+        'sat': 'saturday',
+        'sun': 'sunday',
+    }
+    return mapping.get(abbrev.lower(), abbrev).lower()
+
+
 def parse_time(time):
     out = []
     if 'startdate' in time:
@@ -679,7 +692,7 @@ def parse_time(time):
     if 'stoptime' in time and 'stopdate' not in time:
         out.append(f'hour < "{time["stoptime"]}"')
     if 'weekdays' in time:
-        days = time['weekdays'].split(",")
-        out_days = [f'"{day}"' for day in days if day[0] != '!']
+        days = [day.strip() for day in time['weekdays'].split(",") if day]
+        out_days = [f'"{expand_weekday(day).title()}"' for day in days if day[0] != '!']
         out.append(f'day {{{",".join(out_days)}}}')
     return " ".join(out)

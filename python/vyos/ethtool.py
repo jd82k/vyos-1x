@@ -20,6 +20,7 @@ from json import loads
 from vyos.utils.network import interface_exists
 from vyos.utils.process import popen
 from vyos.netlink import coalesce
+from vyos.netlink import timestamp
 
 # These drivers do not support using ethtool to change the speed, duplex, or
 # flow control settings
@@ -34,9 +35,9 @@ _drivers_without_bonding_support = _drivers_without_mac_change + []
 
 class Ethtool:
     """
-    Class is used to retrive and cache information about an ethernet adapter
+    Class is used to retrieve and cache information about an ethernet adapter
     """
-    # dictionary containing driver featurs, it will be populated on demand and
+    # dictionary containing driver features, it will be populated on demand and
     # the content will look like:
     # [{'esp-hw-offload': {'active': False, 'fixed': True, 'requested': False},
     #   'esp-tx-csum-hw-offload': {'active': False,
@@ -68,6 +69,7 @@ class Ethtool:
     _flow_control = None
     _channels = ''
     _coalesce = None
+    _hw_timestamp_filters = None
 
     def __init__(self, ifname):
         # Get driver used for interface
@@ -79,7 +81,7 @@ class Ethtool:
         if driver:
             self._driver_name = driver.group(1)
 
-        # Build a dictinary of supported link-speed and dupley settings.
+        # Build a dictionary of supported link-speed and dupley settings.
         # [ {
         #     "ifname": "eth0",
         #     "supported-ports": [ "TP" ],
@@ -128,6 +130,10 @@ class Ethtool:
         # Get information about NIC coalesce settings
         with contextlib.suppress(coalesce.CoalesceError, coalesce.GeneralNetlinkError):
             self._coalesce = coalesce.get_coalesce(ifname)
+
+        # Get supported hardware timestamp receive filters
+        with contextlib.suppress(timestamp.TsInfoError, timestamp.GeneralNetlinkError):
+            self._hw_timestamp_filters = timestamp.get_hw_timestamp_filters(ifname)
 
     def check_auto_negotiation_supported(self):
         """ Check if the NIC supports changing auto-negotiation """
@@ -187,7 +193,7 @@ class Ethtool:
 
     def check_speed_duplex(self, speed, duplex):
         """ Check if the passed speed and duplex combination is supported by
-        the underlaying network adapter. """
+        the underlying network adapter. """
         if isinstance(speed, int):
             speed = str(speed)
         if speed != 'auto' and not speed.isdigit():
@@ -255,3 +261,7 @@ class Ethtool:
         """Get all 'coalesce' parameters for the interface"""
 
         return self._coalesce.copy() if self._coalesce else {}
+
+    def get_hw_timestamp_filters(self):
+        """Get supported hardware timestamp receive filter names"""
+        return self._hw_timestamp_filters or set()

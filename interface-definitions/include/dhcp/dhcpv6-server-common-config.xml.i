@@ -28,6 +28,7 @@
     <constraintErrorMessage>Preference must be between 0 and 255</constraintErrorMessage>
   </properties>
 </leafNode>
+#include <include/dhcp/log-level.xml.i>
 <tagNode name="shared-network-name">
   <properties>
     <help>DHCPv6 shared network name</help>
@@ -241,6 +242,7 @@
                 <constraint>
                   <validator name="ipv6-address"/>
                 </constraint>
+                <multi/>
               </properties>
             </leafNode>
             <leafNode name="ipv6-prefix">
@@ -253,6 +255,7 @@
                 <constraint>
                   <validator name="ipv6-prefix"/>
                 </constraint>
+                <multi/>
               </properties>
             </leafNode>
           </children>

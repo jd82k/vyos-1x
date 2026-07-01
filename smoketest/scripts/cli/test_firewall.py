@@ -292,6 +292,33 @@ class TestFirewall(VyOSUnitTestSHIM.TestCase):
 
         self.verify_nftables(nftables_search, 'ip vyos_filter')
 
+    def test_ipv4_time_weekdays(self):
+        name = 'v4-time-weekdays-test'
+        rule_base = ['firewall', 'ipv4', 'name', name, 'rule', '10']
+
+        self.cli_set(rule_base + ['action', 'accept'])
+        self.cli_set(rule_base + ['time', 'weekdays', 'mon,friday'])
+
+        self.cli_commit()
+
+        nftables_search = [
+            [f'chain NAME_{name}'],
+            ['meta day { "Monday", "Friday" }'],
+        ]
+
+        self.verify_nftables(nftables_search, 'ip vyos_filter')
+
+        self.cli_set(rule_base + ['time', 'weekdays', 'Monday, Sat'])
+
+        self.cli_commit()
+
+        nftables_search = [
+            [f'chain NAME_{name}'],
+            ['meta day { "Monday", "Saturday" }'],
+        ]
+
+        self.verify_nftables(nftables_search, 'ip vyos_filter')
+
     def test_ipv4_advanced(self):
         name = 'smoketest-adv'
         name2 = 'smoketest-adv2'
@@ -413,9 +440,11 @@ class TestFirewall(VyOSUnitTestSHIM.TestCase):
     def test_ipv4_dynamic_groups(self):
         group01 = 'knock01'
         group02 = 'allowed'
+        group03 = 'restricted'
 
         self.cli_set(['firewall', 'group', 'dynamic-group', 'address-group', group01])
         self.cli_set(['firewall', 'group', 'dynamic-group', 'address-group', group02])
+        self.cli_set(['firewall', 'group', 'dynamic-group', 'address-group', group03])
 
         self.cli_set(['firewall', 'ipv4', 'input', 'filter', 'rule', '10', 'action', 'drop'])
         self.cli_set(['firewall', 'ipv4', 'input', 'filter', 'rule', '10', 'protocol', 'tcp'])
@@ -435,18 +464,26 @@ class TestFirewall(VyOSUnitTestSHIM.TestCase):
         self.cli_set(['firewall', 'ipv4', 'input', 'filter', 'rule', '30', 'destination', 'port', '22'])
         self.cli_set(['firewall', 'ipv4', 'input', 'filter', 'rule', '30', 'source', 'group', 'dynamic-address-group', group02])
 
+        self.cli_set(['firewall', 'ipv4', 'forward', 'filter', 'rule', '40', 'action', 'drop'])
+        self.cli_set(['firewall', 'ipv4', 'forward', 'filter', 'rule', '40', 'protocol', 'tcp'])
+        self.cli_set(['firewall', 'ipv4', 'forward', 'filter', 'rule', '40', 'destination', 'port', '6667'])
+        self.cli_set(['firewall', 'ipv4', 'forward', 'filter', 'rule', '40', 'add-address-to-group', 'destination-address', 'address-group', group03])
+
         self.cli_commit()
 
         nftables_search = [
             [f'DA_{group01}'],
             [f'DA_{group02}'],
+            [f'DA_{group03}'],
             ['type ipv4_addr'],
             ['flags dynamic,timeout'],
             ['chain VYOS_INPUT_filter {'],
             ['type filter hook input priority filter', 'policy accept'],
             ['tcp dport 5151', f'update @DA_{group01}', '{ ip saddr timeout 30s }', 'drop'],
             ['tcp dport 7272', f'ip saddr @DA_{group01}', f'update @DA_{group02}', '{ ip saddr timeout 5m }', 'drop'],
-            ['tcp dport 22', f'ip saddr @DA_{group02}', 'accept']
+            ['tcp dport 22', f'ip saddr @DA_{group02}', 'accept'],
+            ['chain VYOS_FORWARD_filter {'],
+            ['tcp dport 6667', f'update @DA_{group03}', '{ ip daddr }', 'drop'],
         ]
 
         self.verify_nftables(nftables_search, 'ip vyos_filter')
@@ -530,6 +567,33 @@ class TestFirewall(VyOSUnitTestSHIM.TestCase):
 
         self.verify_nftables(nftables_search, 'ip6 vyos_filter')
 
+    def test_ipv6_time_weekdays(self):
+        name = 'v6-time-weekdays-test'
+        rule_base = ['firewall', 'ipv6', 'name', name, 'rule', '10']
+
+        self.cli_set(rule_base + ['action', 'accept'])
+        self.cli_set(rule_base + ['time', 'weekdays', 'mon,friday'])
+
+        self.cli_commit()
+
+        nftables_search = [
+            [f'chain NAME6_{name}'],
+            ['meta day { "Monday", "Friday" }'],
+        ]
+
+        self.verify_nftables(nftables_search, 'ip6 vyos_filter')
+
+        self.cli_set(rule_base + ['time', 'weekdays', 'Monday, Sat'])
+
+        self.cli_commit()
+
+        nftables_search = [
+            [f'chain NAME6_{name}'],
+            ['meta day { "Monday", "Saturday" }'],
+        ]
+
+        self.verify_nftables(nftables_search, 'ip6 vyos_filter')
+
     def test_ipv6_advanced(self):
         name = 'v6-smoke-adv'
 
@@ -605,9 +669,11 @@ class TestFirewall(VyOSUnitTestSHIM.TestCase):
     def test_ipv6_dynamic_groups(self):
         group01 = 'knock01'
         group02 = 'allowed'
+        group03 = 'restricted'
 
         self.cli_set(['firewall', 'group', 'dynamic-group', 'ipv6-address-group', group01])
         self.cli_set(['firewall', 'group', 'dynamic-group', 'ipv6-address-group', group02])
+        self.cli_set(['firewall', 'group', 'dynamic-group', 'ipv6-address-group', group03])
 
         self.cli_set(['firewall', 'ipv6', 'input', 'filter', 'rule', '10', 'action', 'drop'])
         self.cli_set(['firewall', 'ipv6', 'input', 'filter', 'rule', '10', 'protocol', 'tcp'])
@@ -627,18 +693,26 @@ class TestFirewall(VyOSUnitTestSHIM.TestCase):
         self.cli_set(['firewall', 'ipv6', 'input', 'filter', 'rule', '30', 'destination', 'port', '22'])
         self.cli_set(['firewall', 'ipv6', 'input', 'filter', 'rule', '30', 'source', 'group', 'dynamic-address-group', group02])
 
+        self.cli_set(['firewall', 'ipv6', 'forward', 'filter', 'rule', '40', 'action', 'drop'])
+        self.cli_set(['firewall', 'ipv6', 'forward', 'filter', 'rule', '40', 'protocol', 'tcp'])
+        self.cli_set(['firewall', 'ipv6', 'forward', 'filter', 'rule', '40', 'destination', 'port', '6667'])
+        self.cli_set(['firewall', 'ipv6', 'forward', 'filter', 'rule', '40', 'add-address-to-group', 'destination-address', 'address-group', group03])
+
         self.cli_commit()
 
         nftables_search = [
             [f'DA6_{group01}'],
             [f'DA6_{group02}'],
+            [f'DA6_{group03}'],
             ['type ipv6_addr'],
             ['flags dynamic,timeout'],
             ['chain VYOS_IPV6_INPUT_filter {'],
             ['type filter hook input priority filter', 'policy accept'],
             ['tcp dport 5151', f'update @DA6_{group01}', '{ ip6 saddr timeout 30s }', 'drop'],
             ['tcp dport 7272', f'ip6 saddr @DA6_{group01}', f'update @DA6_{group02}', '{ ip6 saddr timeout 5m }', 'drop'],
-            ['tcp dport 22', f'ip6 saddr @DA6_{group02}', 'accept']
+            ['tcp dport 22', f'ip6 saddr @DA6_{group02}', 'accept'],
+            ['chain VYOS_IPV6_FORWARD_filter {'],
+            ['tcp dport 6667', f'update @DA6_{group03}', '{ ip6 daddr }', 'drop'],
         ]
 
         self.verify_nftables(nftables_search, 'ip6 vyos_filter')
@@ -945,6 +1019,20 @@ class TestFirewall(VyOSUnitTestSHIM.TestCase):
         self.cli_set(['firewall', 'global-options', 'state-policy', 'established', 'log'])
         self.cli_set(['firewall', 'global-options', 'state-policy', 'related', 'action', 'accept'])
         self.cli_set(['firewall', 'global-options', 'state-policy', 'invalid', 'action', 'drop'])
+
+        # Test error on offload from local zone
+        self.cli_set(['firewall', 'flowtable', 'smoketest', 'interface', 'eth0'])
+        self.cli_set(['firewall', 'flowtable', 'smoketest', 'offload', 'software'])
+        self.cli_set(['firewall', 'ipv4', 'name', 'smoketest', 'rule', '1', 'action', 'offload'])
+        self.cli_set(['firewall', 'ipv4', 'name', 'smoketest', 'rule', '1', 'offload-target', 'smoketest'])
+        self.cli_set(['firewall', 'ipv4', 'name', 'smoketest', 'rule', '1', 'state', 'established'])
+        self.cli_set(['firewall', 'ipv4', 'name', 'smoketest', 'rule', '1', 'state', 'related'])
+
+        with self.assertRaises(ConfigSessionError):
+            self.cli_commit()
+
+        self.cli_delete(['firewall', 'flowtable', 'smoketest'])
+        self.cli_delete(['firewall', 'ipv4', 'name', 'smoketest', 'rule', '1'])
 
         self.cli_commit()
 

@@ -52,11 +52,12 @@ systemd_services = {
 }
 
 internal_ports = {
-    'certbot_haproxy' : 65080, # Certbot running behing haproxy
+    'certbot_haproxy' : 65080, # Certbot running behind haproxy
 }
 
 config_files = {
     'sshd_user_ca' : '/run/sshd/trusted_user_ca',
+    'igmp_proxy' : '/run/igmpproxy/igmpproxy.conf',
 }
 
 config_status = '/tmp/vyos-config-status'
@@ -99,3 +100,13 @@ SSH_DSA_DEPRECATION_WARNING: str = \
 'Support for SSH-DSA keys is deprecated and will be removed in VyOS 1.6. ' \
 'Please update affected keys to a supported algorithm (e.g., RSA, ECDSA or ' \
 'ED25519) to avoid authentication failures after the upgrade.'
+
+reference_tree_cache = '/usr/share/vyos/reftree.cache'
+
+activation_list = os.path.join(directories['config'], 'activation-list')
+activation_init = os.path.join(directories['data'], 'activation-init')
+activation_hint = os.path.join(directories['data'], '.activation_hint')
+
+config_sync_exclusion_list = os.path.join(
+    directories['data'], 'config-sync-exclude.json'
+)

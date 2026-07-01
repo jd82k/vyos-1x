@@ -47,6 +47,7 @@ kea4_options = {
     'captive_portal': 'v4-captive-portal',
     'capwap_controller': 'capwap-ac-v4',
     'interface_mtu': 'interface-mtu',
+    'bootfile_name': 'boot-file-name',
 }
 
 kea6_options = {
@@ -79,13 +80,22 @@ def _format_hex_string(in_str):
 def _find_list_of_dict_index(lst, key='ip', value=''):
     """
     Find the index entry of list of dict matching the dict value
-    Exampe:
+    Example:
         % lst = [{'ip': '192.0.2.1'}, {'ip': '192.0.2.2'}]
         % _find_list_of_dict_index(lst, key='ip', value='192.0.2.2')
         % 1
     """
     idx = next((index for (index, d) in enumerate(lst) if d[key] == value), None)
     return idx
+
+
+def _read_posix_timezone(tz_name):
+    try:
+        with open(f'/usr/share/zoneinfo/{tz_name}', 'rb') as f:
+            return f.read().split(b'\n')[-2].decode('utf-8').replace(',', '\\,')
+    except (FileNotFoundError, IOError, IndexError) as e:
+        raise ConfigError(f'Failed to read timezone data for: {tz_name}') from e
+
 
 def kea_test_config(process: str, config_path: str) -> tuple[bool, str]:
     result, output = rc_cmd(f'{process} -t {config_path}')
@@ -95,6 +105,7 @@ def kea_test_config(process: str, config_path: str) -> tuple[bool, str]:
 
     find = re.search(r'Error encountered:\s([^\n$]+)', output)
     return (False, find[1] if find else None)
+
 
 def kea_parse_options(config):
     options = []
@@ -140,9 +151,7 @@ def kea_parse_options(config):
         )
 
     if 'time_zone' in config:
-        with open('/usr/share/zoneinfo/' + config['time_zone'], 'rb') as f:
-            tz_string = f.read().split(b'\n')[-2].decode('utf-8')
-
+        tz_string = _read_posix_timezone(config['time_zone'])
         options.append({'name': 'pcode', 'data': tz_string})
         options.append({'name': 'tcode', 'data': config['time_zone']})
 
@@ -150,15 +159,24 @@ def kea_parse_options(config):
         config, 'vendor_option', 'ubiquiti', 'unifi_controller'
     )
     if unifi_controller:
+        options.append({'name': 'vendor-encapsulated-options'})
         options.append(
-            {'name': 'unifi-controller', 'data': unifi_controller, 'space': 'ubnt'}
+            {
+                'name': 'ubnt',
+                'data': unifi_controller,
+                'space': 'vendor-encapsulated-options-space',
+            }
         )
 
     return options
 
 
 def kea_parse_subnet(subnet, config):
-    out = {'subnet': subnet, 'id': int(config['subnet_id']), 'user-context': {'enable-ping-check': False}}
+    out = {
+        'subnet': subnet,
+        'id': int(config['subnet_id']),
+        'user-context': {'enable-ping-check': False},
+    }
 
     if 'option' in config:
         out['option-data'] = kea_parse_options(config['option'])
@@ -207,6 +225,9 @@ def kea_parse_subnet(subnet, config):
         reservations = []
         for host, host_config in config['static_mapping'].items():
             if 'disable' in host_config:
+                continue
+
+            if 'mac' not in host_config and 'duid' not in host_config:
                 continue
 
             reservation = {
@@ -273,6 +294,11 @@ def kea6_parse_options(config):
 
         if hosts:
             options.append({'name': 'sip-server-dns', 'data': ', '.join(hosts)})
+
+    if 'time_zone' in config:
+        tz_string = _read_posix_timezone(config['time_zone'])
+        options.append({'name': 'new-posix-timezone', 'data': tz_string})
+        options.append({'name': 'new-tzdb-timezone', 'data': config['time_zone']})
 
     cisco_tftp = dict_search_args(config, 'vendor_option', 'cisco', 'tftp-server')
     if cisco_tftp:
@@ -347,6 +373,9 @@ def kea6_parse_subnet(subnet, config):
             if 'disable' in host_config:
                 continue
 
+            if 'mac' not in host_config and 'duid' not in host_config:
+                continue
+
             reservation = {'hostname': host}
 
             if 'mac' in host_config:
@@ -356,10 +385,10 @@ def kea6_parse_subnet(subnet, config):
                 reservation['duid'] = host_config['duid']
 
             if 'ipv6_address' in host_config:
-                reservation['ip-addresses'] = [host_config['ipv6_address']]
+                reservation['ip-addresses'] = host_config['ipv6_address']
 
             if 'ipv6_prefix' in host_config:
-                reservation['prefixes'] = [host_config['ipv6_prefix']]
+                reservation['prefixes'] = host_config['ipv6_prefix']
 
             if 'option' in host_config:
                 reservation['option-data'] = kea6_parse_options(host_config['option'])
@@ -370,6 +399,7 @@ def kea6_parse_subnet(subnet, config):
 
     return out
 
+
 def kea_parse_tsig_algo(algo_spec):
     translate = {
         'md5': 'HMAC-MD5',
@@ -377,14 +407,16 @@ def kea_parse_tsig_algo(algo_spec):
         'sha224': 'HMAC-SHA224',
         'sha256': 'HMAC-SHA256',
         'sha384': 'HMAC-SHA384',
-        'sha512': 'HMAC-SHA512'
+        'sha512': 'HMAC-SHA512',
     }
     if algo_spec not in translate:
         raise ConfigError(f'Unsupported TSIG algorithm: {algo_spec}')
     return translate[algo_spec]
 
+
 def kea_parse_enable_disable(value):
     return True if value == 'enable' else False
+
 
 def kea_parse_ddns_settings(config):
     data = {}
@@ -393,7 +425,9 @@ def kea_parse_ddns_settings(config):
         data['ddns-send-updates'] = kea_parse_enable_disable(send_updates)
 
     if override_client_update := config.get('override_client_update'):
-        data['ddns-override-client-update'] = kea_parse_enable_disable(override_client_update)
+        data['ddns-override-client-update'] = kea_parse_enable_disable(
+            override_client_update
+        )
 
     if override_no_update := config.get('override_no_update'):
         data['ddns-override-no-update'] = kea_parse_enable_disable(override_no_update)
@@ -402,7 +436,9 @@ def kea_parse_ddns_settings(config):
         data['ddns-update-on-renew'] = kea_parse_enable_disable(update_on_renew)
 
     if conflict_resolution := config.get('conflict_resolution'):
-        data['ddns-use-conflict-resolution'] = kea_parse_enable_disable(conflict_resolution)
+        data['ddns-use-conflict-resolution'] = kea_parse_enable_disable(
+            conflict_resolution
+        )
 
     if 'replace_client_name' in config:
         data['ddns-replace-client-name'] = config['replace_client_name']
@@ -418,6 +454,7 @@ def kea_parse_ddns_settings(config):
         data['hostname-char-replacement'] = config['hostname_char_replacement']
 
     return data
+
 
 def _ctrl_socket_command(inet, vrf_name, command, args=None):
     if vrf_name:
@@ -602,7 +639,9 @@ def kea_get_static_mappings(config, inet, pools=[]) -> list:
     return mappings
 
 
-def kea_get_server_leases(config, inet, vrf_name, pools=[], state=[], origin=None) -> list:
+def kea_get_server_leases(
+    config, inet, vrf_name, pools=[], state=[], origin=None
+) -> list:
     """
     Get DHCP server leases from active Kea DHCPv4 or DHCPv6 configuration
     :return list
@@ -658,9 +697,10 @@ def kea_get_server_leases(config, inet, vrf_name, pools=[], state=[], origin=Non
 
         now = datetime.now(timezone.utc)
         if lease['valid-lft'] > 0 and lease['expire_time'] > now:
-            # substraction gives us a timedelta object which can't be formatted
-            # with strftime so we use str(), split gets rid of the microseconds
-            data_lease['remaining'] = str(lease['expire_time'] - now).split('.')[0]
+            # clear the microseconds before subtraction for visual clarity
+            data_lease['remaining'] = lease['expire_time'].replace(
+                microsecond=0
+            ) - now.replace(microsecond=0)
 
         # Do not add old leases
         if (
@@ -684,21 +724,31 @@ def kea_get_server_leases(config, inet, vrf_name, pools=[], state=[], origin=Non
 
     return data
 
+
 def _build_relay_hex_condition(sub_option_index, value):
-    if value.startswith("0x"):
-        return f"relay4[{sub_option_index}].hex == {value}"
+    if value.startswith('0x'):
+        return f'relay4[{sub_option_index}].hex == {value}'
     else:
-        return f"relay4[{sub_option_index}].hex == 0x{value.encode().hex().lower()}"
+        return f'relay4[{sub_option_index}].hex == 0x{value.encode().hex().lower()}'
+
 
 def kea_build_client_class_test(config):
     conditions = []
 
-    if "relay_agent_information" in config:
-        if "circuit_id" in config["relay_agent_information"]:
-            conditions.append(_build_relay_hex_condition(1, config["relay_agent_information"]["circuit_id"]))
-        if "remote_id" in config["relay_agent_information"]:
-            conditions.append(_build_relay_hex_condition(2, config["relay_agent_information"]["remote_id"]))
+    if 'relay_agent_information' in config:
+        if 'circuit_id' in config['relay_agent_information']:
+            conditions.append(
+                _build_relay_hex_condition(
+                    1, config['relay_agent_information']['circuit_id']
+                )
+            )
+        if 'remote_id' in config['relay_agent_information']:
+            conditions.append(
+                _build_relay_hex_condition(
+                    2, config['relay_agent_information']['remote_id']
+                )
+            )
 
-    test = " and ".join(conditions)
+    test = ' and '.join(conditions)
 
     return test

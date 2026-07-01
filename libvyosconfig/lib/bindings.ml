@@ -12,6 +12,7 @@ module RT = Reference_tree
 module TA = Tree_alg
 module CM = Commit
 module VC = Vycall_client
+module CDict = Config_dict
 
 module I = Internal.Make(Config_tree)
 module IR = Internal.Make(Reference_tree)
@@ -91,6 +92,46 @@ let write_internal c_ptr file =
         error_message := "";
         let ct = Root.get c_ptr in
         (I.write_internal[@alert "-exn"]) ct file
+    with Internal.Write_error msg ->
+        error_message := msg
+
+let read_internal_string s =
+    (* alert exn Internal.read_string:
+        [Internal.Read_error] caught
+     *)
+    try
+        error_message := "";
+        let ct = (I.read_string[@alert "-exn"]) s in
+        Ctypes.Root.create ct
+    with Internal.Read_error msg ->
+        error_message := msg; Ctypes.null
+
+let write_internal_string c_ptr =
+    let ct = Root.get c_ptr in
+    I.write_string ct
+
+let render_json_reference_tree c_ptr =
+    RT.render_json (Root.get c_ptr)
+
+let read_internal_reference_tree file =
+    (* alert exn Internal.read_internal:
+        [Internal.Read_error] caught
+     *)
+    try
+        error_message := "";
+        let rt = (IR.read_internal[@alert "-exn"]) file in
+        Ctypes.Root.create rt
+    with Internal.Read_error msg ->
+        error_message := msg; Ctypes.null
+
+let write_internal_reference_tree c_ptr file =
+    (* alert exn Internal.write_internal:
+        [Internal.Write_error] caught
+     *)
+    try
+        error_message := "";
+        let ct = Root.get c_ptr in
+        (IR.write_internal[@alert "-exn"]) ct file
     with Internal.Write_error msg ->
         error_message := msg
 
@@ -436,7 +477,7 @@ let reference_tree_to_json internal_cache from_dir to_file =
             let s = Printf.sprintf "Write_error \'%s\'" msg in
             error_message := s; 1
 
-let mask_tree c_ptr_l c_ptr_r =
+let mask_tree c_ptr_l c_ptr_r exclusive =
     (* alert exn CD.mask_tree:
         [Config_diff.Incommensurable] caught
         [Config_diff.Empty_comparison] caught
@@ -444,11 +485,24 @@ let mask_tree c_ptr_l c_ptr_r =
     let ct_l = Root.get c_ptr_l in
     let ct_r = Root.get c_ptr_r in
     try
-        let ct_ret = (CD.mask_tree[@alert "-exn"]) ct_l ct_r in
+        let ct_ret = (CD.mask_tree[@alert "-exn"]) ~exclusive:exclusive ct_l ct_r in
         Ctypes.Root.create ct_ret
     with
         | CD.Incommensurable -> error_message := "Incommensurable"; Ctypes.null
         | CD.Empty_comparison -> error_message := "Empty comparison"; Ctypes.null
+
+let subtree_from_partial r_ptr c_ptr i_ptr path =
+    let rt = Root.get r_ptr in
+    let ct = Root.get c_ptr in
+    let input = Root.get i_ptr in
+    let path = split_on_whitespace path in
+    try
+        error_message := "";
+        let ct_ret = (CD.subtree_from_partial[@alert "-exn"]) rt ct input path in
+        Ctypes.Root.create ct_ret
+    with
+        CD.Malformed_path s ->
+            error_message := s; Ctypes.null
 
 let validate_tree_filter c_ptr rt_cache_path validator_dir =
     (* alert exn Internal.read_internal:
@@ -465,6 +519,13 @@ let validate_tree_filter c_ptr rt_cache_path validator_dir =
     with Internal.Read_error msg ->
         error_message := msg; c_ptr
 
+let config_dict c_ptr_c c_ptr_r c_ptr_m path get_node with_defaults =
+    let ct = Root.get c_ptr_c in
+    let rt = Root.get c_ptr_r in
+    let mask = Root.get c_ptr_m in
+    let path = split_on_whitespace path in
+    let with_node = not get_node in
+    CDict.config_dict ~with_defaults:with_defaults ~with_first_node:with_node rt ct mask path
 
 module Stubs(I : Cstubs_inverted.INTERNAL) =
 struct
@@ -480,6 +541,11 @@ struct
   let () = I.internal "to_commands" ((ptr void) @-> string @-> returning string) render_commands
   let () = I.internal "read_internal" (string @-> returning (ptr void)) read_internal
   let () = I.internal "write_internal" ((ptr void) @-> string @-> returning void) write_internal
+  let () = I.internal "read_internal_string" (string @-> returning (ptr void)) read_internal_string
+  let () = I.internal "write_internal_string" ((ptr void) @-> returning string) write_internal_string
+  let () = I.internal "to_json_reference_tree" ((ptr void) @-> returning string) render_json_reference_tree
+  let () = I.internal "read_internal_reference_tree" (string @-> returning (ptr void)) read_internal_reference_tree
+  let () = I.internal "write_internal_reference_tree" ((ptr void) @-> string @-> returning void) write_internal_reference_tree
   let () = I.internal "create_node" ((ptr void) @-> string @-> returning int) create_node
   let () = I.internal "set_add_value" ((ptr void) @-> string @-> string @-> returning int) set_add_value
   let () = I.internal "set_replace_value" ((ptr void) @-> string @-> string @-> returning int) set_replace_value
@@ -503,6 +569,8 @@ struct
   let () = I.internal "tree_union" ((ptr void) @-> (ptr void) @-> returning (ptr void)) tree_union
   let () = I.internal "tree_merge" (bool @-> (ptr void) @-> (ptr void) @-> returning (ptr void)) tree_merge
   let () = I.internal "reference_tree_to_json" (string @-> string @-> string @-> returning int) reference_tree_to_json
-  let () = I.internal "mask_tree" ((ptr void) @-> (ptr void) @-> returning (ptr void)) mask_tree
+  let () = I.internal "mask_tree" ((ptr void) @-> (ptr void) @-> bool @-> returning (ptr void)) mask_tree
+  let () = I.internal "subtree_from_partial" ((ptr void) @-> (ptr void) @-> (ptr void) @-> string @-> returning (ptr void)) subtree_from_partial
   let () = I.internal "validate_tree_filter" ((ptr void) @-> string @-> string @-> returning (ptr void)) validate_tree_filter
+  let () = I.internal "config_dict" ((ptr void) @-> (ptr void) @-> (ptr void) @-> string @-> bool @-> bool @-> returning string) config_dict
 end

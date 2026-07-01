@@ -28,10 +28,12 @@ libvyosconfig:
 
 .PHONY: interface_definitions
 .ONESHELL:
-interface_definitions: $(config_xml_obj)
-	mkdir -p $(TMPL_DIR)
+interface_definitions: libvyosconfig $(config_xml_obj)
+	rm -rf $(TMPL_DIR); mkdir -p $(TMPL_DIR)
 
 	$(CURDIR)/scripts/override-default $(BUILD_DIR)/interface-definitions
+	$(CURDIR)/scripts/override-help $(BUILD_DIR)/interface-definitions
+	$(CURDIR)/scripts/check-properties-collision $(BUILD_DIR)/interface-definitions
 
 	find $(BUILD_DIR)/interface-definitions -type f -name "*.xml" | xargs -I {} $(CURDIR)/scripts/build-command-templates {} $(CURDIR)/schema/interface_definition.rng $(TMPL_DIR) || exit 1
 
@@ -50,15 +52,11 @@ interface_definitions: $(config_xml_obj)
 	# could mask help strings or mandatory priority statements
 	find $(TMPL_DIR) -name node.def -type f -empty -exec false {} + || sh -c 'echo "There are empty node.def files! Check your interface definitions." && exit 1'
 
-ifeq ($(BUILD_ARCH),arm64)
-	# There is currently no telegraf support in VyOS for ARM64, remove CLI definitions
-	rm -rf $(TMPL_DIR)/service/monitoring/telegraf
-endif
 
 .PHONY: op_mode_definitions
 .ONESHELL:
 op_mode_definitions: $(op_xml_obj)
-	mkdir -p $(OP_TMPL_DIR)
+	rm -rf $(OP_TMPL_DIR); mkdir -p $(OP_TMPL_DIR)
 
 	find $(BUILD_DIR)/op-mode-definitions/ -type f -name "*.xml" | xargs -I {} $(CURDIR)/scripts/build-command-op-templates {} $(CURDIR)/schema/op-mode-definition.rng $(OP_TMPL_DIR) || exit 1
 
@@ -81,8 +79,12 @@ op_mode_definitions: $(op_xml_obj)
 vyshim:
 	$(MAKE) -C $(SHIM_DIR)
 
+.PHONY: ocaml
+ocaml: libvyosconfig
+	$(MAKE) -C src/ocaml
+
 .PHONY: all
-all: clean copyright libvyosconfig pylint interface_definitions op_mode_definitions test j2lint vyshim generate-configd-include-json
+all: clean copyright libvyosconfig pylint interface_definitions op_mode_definitions test j2lint vyshim generate-configd-include-json generate-activation-scripts-json ocaml
 
 .PHONY: copyright
 copyright:
@@ -97,6 +99,7 @@ clean:
 	rm -rf $(TMPL_DIR)
 	rm -rf $(OP_TMPL_DIR)
 	$(MAKE) -C $(SHIM_DIR) clean
+	$(MAKE) -C src/ocaml clean
 
 .PHONY: test
 test: generate-configd-include-json
@@ -113,7 +116,7 @@ check_migration_scripts_executable:
 pylint: interface_definitions
 	@echo Running "pylint ..."
 	@set -e; \
-	PYTHONPATH="python/:smoketest/scripts/cli/" pylint --errors-only $(shell git ls-files python/vyos/ifconfig/*.py python/vyos/utils/*.py src/conf_mode/*.py src/op_mode/*.py src/migration-scripts src/services/vyos* smoketest/scripts); \
+	PYTHONPATH="python/:smoketest/scripts/cli/" pylint --errors-only $(shell git ls-files python/**/*.py src/conf_mode/*.py src/op_mode/*.py src/migration-scripts src/services/vyos* smoketest/scripts); \
 	PYTHONPATH=python/ pylint --disable=all --enable=W0611 $(shell git ls-files *.py src/migration-scripts src/services)
 
 .PHONY: j2lint
@@ -123,16 +126,16 @@ ifndef J2LINT
 endif
 	$(J2LINT) data/
 
-.PHONY: sonar
-sonar:
-	sonar-scanner -X -Dsonar.login=${SONAR_TOKEN}
-
 deb:
 	dpkg-buildpackage -uc -us -tc -b
 
 .PHONY: generate-configd-include-json
 generate-configd-include-json:
 	@scripts/generate-configd-include-json.py
+
+.PHONY: generate-activation-scripts-json
+generate-activation-scripts-json:
+	@scripts/generate-activation-scripts-json.py
 
 .PHONY: schema
 schema:

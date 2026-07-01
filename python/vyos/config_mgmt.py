@@ -38,11 +38,13 @@ from vyos.configtree import ConfigTreeError
 from vyos.configsession import ConfigSession
 from vyos.configsession import ConfigSessionError
 from vyos.configtree import diff_compare
+from vyos.configtree import DiffTree
 from vyos.load_config import load
 from vyos.load_config import LoadConfigError
 from vyos.defaults import directories
 from vyos.version import get_full_version_data
 from vyos.utils.io import ask_yes_no
+from vyos.utils.io import catch_broken_pipe
 from vyos.utils.boot import boot_configuration_complete
 from vyos.utils.process import is_systemd_service_active
 from vyos.utils.process import rc_cmd
@@ -171,11 +173,16 @@ class ConfigMgmt:
         # upload only on existence of effective values, notably, on boot.
         # one still needs session self.locations (above) for setting
         # post-commit hook in conf_mode script
-        path = ['system', 'config-management', 'commit-archive', 'location']
-        if config.exists_effective(path):
-            self.effective_locations = config.return_effective_values(path)
-        else:
-            self.effective_locations = []
+        base_path = ['system', 'config-management', 'commit-archive']
+        location_path = base_path + ['location']
+        self.effective_locations = None
+        if config.exists_effective(location_path):
+            self.effective_locations = config.return_effective_values(location_path)
+
+        vrf_path = base_path + ['vrf']
+        self.effective_vrf = None
+        if config.exists_effective(vrf_path):
+            self.effective_vrf = config.return_effective_value(vrf_path)
 
         # a call to compare without args is edit_level aware
         edit_level = os.getenv('VYATTA_EDIT_LEVEL', '')
@@ -445,6 +452,80 @@ Proceed ?"""
 
         return self.compare(commands=cmnds, rev1=r1, rev2=r2)
 
+    def _format_remote_diff(self, diff_tree: DiffTree, path: list, commands: bool):
+        add_tree = diff_tree.add
+        del_tree = diff_tree.delete
+        command_prefix = ' '.join(path)
+
+        result_lines = []
+        if commands:
+            # Process the deleted elements into command format and filter based on prefix (path)
+            for line in del_tree.to_commands(op='delete').splitlines():
+                if line.startswith(f'delete {command_prefix}'):
+                    result_lines.append(line)
+
+            # Process the added elements into command format and filter based on prefix (path)
+            for line in add_tree.to_commands(op='set').splitlines():
+                if line.startswith(f'set {command_prefix}'):
+                    result_lines.append(line)
+        else:
+            with_node = len(path) > 1
+            # Retrieve subtrees for the specified path from both added and deleted trees
+            del_tree = del_tree.get_subtree(path, with_node=with_node)
+            add_tree = add_tree.get_subtree(path, with_node=with_node)
+
+            # Convert the subtrees to string lines for further processing
+            del_tree_lines = str(del_tree).splitlines()
+            add_tree_lines = str(add_tree).splitlines()
+
+            # Format the lines with a prefix ('-', '+') and filter out empty lines
+            del_lines = [f'- {l}' for l in del_tree_lines if l.strip()]
+            add_lines = [f'+ {l}' for l in add_tree_lines if l.strip()]
+
+            if del_lines or add_lines:
+                # Adjust command prefix if a node is present in the path
+                command_prefix = ' '.join(path[:-1]) if with_node else command_prefix
+                if command_prefix:
+                    result_lines.append(f'[{command_prefix}]')
+
+                # Combine both deleted and added lines and process them
+                result_lines.extend(del_lines + add_lines)
+
+        # Join the result lines into a single string, excluding empty lines
+        return '\n'.join((line for line in result_lines if line.strip()))
+
+    def remote_compare(
+        self,
+        source: str,
+        remote_tree: ConfigTree,
+        path: Optional[list] = None,
+        commands: bool = False,
+    ) -> str:
+        """
+        Compares a local configuration tree with a remote
+        configuration tree based on the specified source ('running', 'candidate', 'saved').
+        """
+        path = path or []
+
+        # Determine the correct local configuration tree based on the 'source' parameter
+        if source == 'running':
+            local_tree = self.active_config
+        elif source == 'candidate':
+            local_tree = self.working_config
+        elif source == 'saved':
+            local_tree = self._get_saved_config_tree()
+        else:
+            raise ConfigMgmtError(
+                'Invalid source, must be one of: running, candidate, saved'
+            )
+
+        try:
+            diff_tree = DiffTree(remote_tree, local_tree)
+        except ConfigTreeError as e:
+            raise ConfigMgmtError(e) from e
+
+        return self._format_remote_diff(diff_tree, path, commands)
+
     # Initialization and post-commit hooks for conf-mode
     #
     def initialize_revision(self):
@@ -498,16 +579,13 @@ Proceed ?"""
 
         if self.effective_locations:
             print('Archiving config...')
-        for location in self.effective_locations:
-            url = urlsplit(location)
-            _, _, netloc = url.netloc.rpartition('@')
-            redacted_location = urlunsplit(url._replace(netloc=netloc))
-            print(f'  {redacted_location}', end=' ', flush=True)
-            upload(
-                archive_config_file,
-                f'{location}/{remote_file}',
-                source_host=source_address,
-            )
+            for location in self.effective_locations:
+                url = urlsplit(location)
+                _, _, netloc = url.netloc.rpartition('@')
+                redacted_location = urlunsplit(url._replace(netloc=netloc))
+                print(f'  {redacted_location}', end=' ', flush=True)
+                upload(archive_config_file, f'{location}/{remote_file}',
+                       source_host=source_address, vrf=self.effective_vrf)
 
     # op-mode functions
     #
@@ -560,6 +638,7 @@ Proceed ?"""
         ret = tabulate(res_l, tablefmt='plain')
         return ret
 
+    @catch_broken_pipe
     def show_commit_diff(
         self, rev: int, rev2: Optional[int] = None, commands: bool = False
     ) -> str:
@@ -800,6 +879,7 @@ Proceed ?"""
 
 # entry_point for console script
 #
+@catch_broken_pipe
 def run():
     from argparse import ArgumentParser, REMAINDER
 
@@ -838,7 +918,7 @@ def run():
     rollback = subparsers.add_parser('rollback', help='Rollback to earlier config')
     rollback.add_argument('--rev', type=int, help='Revision number for rollback')
     rollback.add_argument(
-        '-y', dest='no_prompt', action='store_true', help='Excute without prompt'
+        '-y', dest='no_prompt', action='store_true', help='Execute without prompt'
     )
 
     rollback_soft = subparsers.add_parser(

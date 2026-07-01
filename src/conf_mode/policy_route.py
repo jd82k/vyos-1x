@@ -21,14 +21,14 @@ from sys import exit
 
 from vyos.base import Warning
 from vyos.config import Config
-from vyos.configdict import node_changed
-from vyos.configdiff import Diff
+from vyos.configdiff import Diff, get_config_diff
 from vyos.template import render
 from vyos.utils.dict import dict_search_args
 from vyos.utils.dict import dict_search_recursive
 from vyos.utils.process import cmd
 from vyos.utils.process import run
 from vyos.utils.network import get_vrf_tableid
+from vyos.utils.network import interface_exists
 from vyos.defaults import rt_global_table
 from vyos.defaults import rt_global_vrf
 from vyos.geoip import  geoip_refresh, geoip_update
@@ -48,28 +48,15 @@ valid_groups = [
 ]
 
 def geoip_updated(conf):
-    updated = False
-
-    changes_v4 = node_changed(conf, ['policy', 'route'],
-                                 key_mangling=('-', '_'),
-                                 recursive=True,
-                                 expand_nodes=Diff.ADD | Diff.DELETE)
-
-    for _, path in dict_search_recursive(changes_v4, 'geoip'):
-        updated = True
-        break
-
-    if not updated:
-        changes_v6 = node_changed(conf, ['policy', 'route6'],
-                                 key_mangling=('-', '_'),
-                                 recursive=True,
-                                 expand_nodes=Diff.ADD | Diff.DELETE)
-
-        for _, path in dict_search_recursive(changes_v6, 'geoip'):
-            updated = True
-            break
-
-    return updated
+    D = get_config_diff(conf, key_mangling=('-', '_'))
+    for path in (['policy', 'route'], ['policy', 'route6']):
+        diff = D.get_child_nodes_diff(path,
+                                      expand_nodes=Diff.ADD | Diff.DELETE,
+                                      recursive=True)
+        if any(any(dict_search_recursive(diff.get(section, {}), 'geoip'))
+               for section in ('add', 'delete')):
+            return True
+    return False
 
 def geoip_sets(policy):
     out = {'name': [], 'ipv6_name': []}
@@ -101,6 +88,9 @@ def get_config(config=None):
 
     policy['geoip_sets'] = geoip_sets(policy)
     policy['geoip_updated'] = geoip_updated(conf)
+    policy['firewall'] = conf.get_config_dict(
+        ['firewall'], key_mangling=('-', '_'),
+        no_tag_node_value_mangle=True, get_first_key=True)
 
     return policy
 
@@ -130,6 +120,11 @@ def verify_rule(policy, name, rule_conf, ipv6, rule_id):
 
         if 'vrf' in rule_conf['set'] and 'table' in rule_conf['set']:
             raise ConfigError(f'{name} rule {rule_id}: Cannot set both forwarding route table and VRF')
+
+        if 'vrf' in rule_conf['set']:
+            vrf = rule_conf['set']['vrf']
+            if vrf != 'default' and not interface_exists(vrf):
+                raise ConfigError(f'{name} rule {rule_id}: VRF "{vrf}" does not exist')
 
     tcp_flags = dict_search_args(rule_conf, 'tcp', 'flags')
     if tcp_flags:
@@ -245,12 +240,10 @@ def apply(policy):
 
     apply_table_marks(policy)
 
-    if policy['geoip_sets']:
-        # Call helper script to Update set contents
-        if 'name' in policy['geoip_sets'] or 'ipv6_name' in policy['geoip_sets']:
-            if policy['geoip_updated'] or not geoip_refresh():
-                print('Updating GeoIP. Please wait...')
-                geoip_update(policy=policy)
+    if policy['geoip_sets']['name'] or policy['geoip_sets']['ipv6_name']:
+        if policy['geoip_updated'] or not geoip_refresh():
+            print('Updating GeoIP. Please wait...')
+            geoip_update(firewall=policy['firewall'], policy=policy)
 
     return None
 

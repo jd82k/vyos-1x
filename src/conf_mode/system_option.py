@@ -28,7 +28,10 @@ from vyos.configverify import verify_interface_exists
 from vyos.system import grub_util
 from vyos.template import render
 from vyos.utils.boot import boot_configuration_complete
+from vyos.utils.convert import range_str_to_list
+from vyos.utils.convert import list_to_range_str
 from vyos.utils.cpu import get_cpus
+from vyos.utils.cpu import get_available_cpus
 from vyos.utils.dict import dict_search
 from vyos.utils.file import write_file
 from vyos.utils.file import read_file
@@ -44,6 +47,7 @@ from vyos import ConfigError
 from vyos import airbag
 
 from vyos.vpp.config_resource_checks import memory as mem_check
+from vyos.vpp.config_resource_checks.resource_defaults import default_resource_map
 
 airbag.enable()
 
@@ -192,6 +196,7 @@ def get_config(config=None):
     if 'performance' in options:
         # Update IPv4/IPv6 and sysctl options after tuned applied it's settings
         set_dependents('ip_ipv6', conf)
+        set_dependents('firewall', conf)
         set_dependents('sysctl', conf)
 
     return options
@@ -239,6 +244,29 @@ def verify(options):
                 f'AMD pstate driver cannot be used with "{cpu_vendor}" CPU!'
             )
 
+        isolate_cpus = dict_search('kernel.cpu.isolate_cpus', options)
+        if isolate_cpus:
+            available_cores = sorted({int(cpu['cpu']) for cpu in get_available_cpus()})
+            cpus_list = range_str_to_list(isolate_cpus)
+            reserved_cpus = default_resource_map.get('reserved_cpu_cores')
+
+            cpus_available = len(available_cores) - reserved_cpus
+            if len(cpus_list) > cpus_available:
+                raise ConfigError(
+                    f'Cannot isolate {len(cpus_list)} CPUs ({isolate_cpus}): '
+                    f'only {cpus_available} of {len(available_cores)} physical cores '
+                    f'are available ({reserved_cpus} reserved for the system)'
+                )
+
+            not_available = [cpu for cpu in cpus_list if cpu not in available_cores]
+            if not_available:
+                not_available_str = list_to_range_str(not_available)
+                available_str = list_to_range_str(available_cores)
+                raise ConfigError(
+                    f'CPU(s) {not_available_str} do not exist on this system. '
+                    f'Available CPUs: {available_str}'
+                )
+
         _, hp_memory_bytes = _get_total_hugepages_and_memory(
             options['kernel'].get('memory', {})
         )
@@ -283,7 +311,7 @@ def generate(options):
 
     # XXX: This code path and if statements must be kept in sync with the Kernel
     # option handling in image_installer.py:get_cli_kernel_options(). This
-    # occurance is used for having the appropriate options passed to GRUB
+    # occurrence is used for having the appropriate options passed to GRUB
     # when re-configuring options on the CLI.
     cmdline_options = []
     kernel_opts = options.get('kernel', {})
@@ -571,7 +599,7 @@ def apply(options):
         }
 
         for parameter, value in parameters.items():
-            sysctl_write(parameter, value)
+            sysctl_write(parameter.split('.'), value)
 
 
 if __name__ == '__main__':

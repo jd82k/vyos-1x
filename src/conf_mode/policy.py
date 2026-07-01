@@ -131,7 +131,7 @@ def verify(config_dict):
             if 'rule' not in instance_config:
                 continue
 
-            # human readable instance name (hypen instead of underscore)
+            # human readable instance name (hyphen instead of underscore)
             policy_hr = policy_type.replace('_', '-')
             entries = []
             for rule, rule_config in instance_config['rule'].items():
@@ -166,6 +166,26 @@ def verify(config_dict):
                 if policy_type in ['prefix_list', 'prefix_list6']:
                     if 'prefix' not in rule_config:
                         raise ConfigError(f'A prefix {mandatory_error}')
+
+                    mask_len = int(rule_config['prefix'].split('/')[1])
+                    ge = dict_search('ge', rule_config)
+                    le = dict_search('le', rule_config)
+
+                    if ge and int(ge) < mask_len:
+                        raise ConfigError(
+                            f'{policy_hr} {instance} rule {rule}: "ge" ({ge}) must be >= '
+                            f'prefix length ({mask_len})'
+                        )
+                    if le and int(le) < mask_len:
+                        raise ConfigError(
+                            f'{policy_hr} {instance} rule {rule}: "le" ({le}) must be >= '
+                            f'prefix length ({mask_len})'
+                        )
+                    if ge and le and int(ge) > int(le):
+                        raise ConfigError(
+                            f'{policy_hr} {instance} rule {rule}: "ge" ({ge}) must be <= '
+                            f'"le" ({le})'
+                        )
 
                     if rule_config in entries:
                         raise ConfigError(

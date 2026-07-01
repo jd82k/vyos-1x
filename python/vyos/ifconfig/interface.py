@@ -48,6 +48,7 @@ from vyos.utils.network import get_interface_namespace
 from vyos.utils.network import get_vrf_tableid
 from vyos.utils.network import is_netns_interface
 from vyos.utils.process import is_systemd_service_active
+from vyos.utils.process import stop_systemd_unit
 from vyos.utils.process import run
 from vyos.utils.file import read_file
 from vyos.utils.file import write_file
@@ -226,6 +227,11 @@ class Interface(Control):
             'location': '/sys/class/net/{ifname}/brport/root_block',
             'errormsg': '{ifname} is not a bridge port member'
         },
+        'learning': {
+            'validate':  assert_boolean,
+            'location': '/sys/class/net/{ifname}/brport/learning',
+            'errormsg': '{ifname} is not a bridge port member'
+        },
         'proxy_arp': {
             'validate': assert_boolean,
             'location': '/proc/sys/net/ipv4/conf/{ifname}/proxy_arp',
@@ -383,8 +389,8 @@ class Interface(Control):
         >>> i.remove()
         """
         # Stop WPA supplicant if EAPoL was in use
-        if is_systemd_service_active(f'wpa_supplicant-wired@{self.ifname}'):
-            self._cmd(f'systemctl stop wpa_supplicant-wired@{self.ifname}')
+        netns = self.config['netns'] if 'netns' in self.config else None
+        stop_systemd_unit(f'wpa_supplicant-wired@{self.ifname}', netns=netns)
 
         # remove all assigned IP addresses from interface - this is a bit redundant
         # as the kernel will remove all addresses on interface deletion, but we
@@ -498,7 +504,7 @@ class Interface(Control):
 
     def get_mac(self):
         """
-        Get current interface MAC (Media Access Contrl) address used.
+        Get current interface MAC (Media Access Control) address used.
 
         Example:
         >>> from vyos.ifconfig import Interface
@@ -554,7 +560,7 @@ class Interface(Control):
 
     def set_mac(self, mac):
         """
-        Set interface MAC (Media Access Contrl) address to given value.
+        Set interface MAC (Media Access Control) address to given value.
 
         Example:
         >>> from vyos.ifconfig import Interface
@@ -572,7 +578,7 @@ class Interface(Control):
 
         self.set_interface('mac', mac)
 
-        # Turn an interface to the 'up' state if it was changed to 'down' by this fucntion
+        # Turn an interface to the 'up' state if it was changed to 'down' by this function
         if prev_state == 'up':
             self.set_admin_state('up')
 
@@ -1226,6 +1232,18 @@ class Interface(Control):
         """
         self.set_interface('bridge_port_isolation', on_or_off)
 
+    def set_learning(self, state):
+        """
+        Set MAC address learning state on a bridge port. When disabled,
+        the bridge will not learn source MAC addresses from incoming frames on
+        this port, causing all unknown unicast traffic to be flooded.
+
+        Example:
+        >>> from vyos.ifconfig import Interface
+        >>> Interface('eth0').set_learning(0)
+        """
+        self.set_interface('learning', state)
+
     def set_proxy_arp(self, enable):
         """
         Set per interface proxy ARP configuration
@@ -1523,7 +1541,7 @@ class Interface(Control):
 
             # set bridge port path priority
             if 'priority' in bridge_config:
-                self.set_path_cost(bridge_config['priority'])
+                self.set_path_priority(bridge_config['priority'])
 
             bridge_vlan_filter = Section.klass(bridge)(bridge, create=True).get_vlan_filter()
 
@@ -1595,22 +1613,23 @@ class Interface(Control):
             render(systemd_override_file, 'dhcp-client/override.conf.j2', self.config)
             render(dhclient_config_file, 'dhcp-client/ipv4.j2', self.config)
 
-            # Reload systemd unit definitons as some options are dynamically generated
+            # Reload systemd unit definitions as some options are dynamically generated
             self._cmd('systemctl daemon-reload')
 
+            netns = self.config['netns'] if 'netns' in self.config else None
             # When the DHCP client is restarted a brief outage will occur, as
             # the old lease is released a new one is acquired (T4203). We will
             # only restart DHCP client if it's option changed, or if it's not
             # running, but it should be running (e.g. on system startup)
             if (vrf_changed or
                 ('dhcp_options_changed' in self.config) or
-                (not is_systemd_service_active(systemd_service))):
+                (not is_systemd_service_active(systemd_service, netns=netns))):
                 return self._cmd(f'systemctl restart {systemd_service}')
         else:
-            if is_systemd_service_active(systemd_service):
-                self._cmd(f'systemctl stop {systemd_service}')
+            netns = self.config['netns'] if 'netns' in self.config else None
+            stop_systemd_unit(systemd_service, netns=netns)
 
-            # Smoketests occationally fail if the lease is not removed from the Kernel fast enough:
+            # Smoketests occasionally fail if the lease is not removed from the Kernel fast enough:
             # AssertionError: 2 unexpectedly found in {17: [{'addr': '52:54:00:00:00:00',
             # 'broadcast': 'ff:ff:ff:ff:ff:ff'}], 2: [{'addr': '192.0.2.103', 'netmask': '255.255.255.0',
             #
@@ -1654,18 +1673,19 @@ class Interface(Control):
             render(config_file, 'dhcp-client/ipv6.j2', config)
             render(script_file, 'dhcp-client/dhcp6c-script.j2', config, permission=0o755)
 
-            # Reload systemd unit definitons as some options are dynamically generated
+            # Reload systemd unit definitions as some options are dynamically generated
             self._cmd('systemctl daemon-reload')
 
+            netns = self.config['netns'] if 'netns' in self.config else None
             # We must ignore any return codes. This is required to enable
             # DHCPv6-PD for interfaces which are yet not up and running.
             if (vrf_changed or
                 ('dhcpv6_options_changed' in self.config) or
-                (not is_systemd_service_active(systemd_service))):
+                (not is_systemd_service_active(systemd_service, netns=netns))):
                 return self._popen(f'systemctl restart {systemd_service}')
         else:
-            if is_systemd_service_active(systemd_service):
-                self._cmd(f'systemctl stop {systemd_service}')
+            netns = self.config['netns'] if 'netns' in self.config else None
+            stop_systemd_unit(systemd_service, netns=netns)
             if os.path.isfile(config_file):
                 os.remove(config_file)
             if os.path.isfile(script_file):
@@ -1677,14 +1697,14 @@ class Interface(Control):
         # Please refer to the document for details
         #   - https://man7.org/linux/man-pages/man8/tc.8.html
         #   - https://man7.org/linux/man-pages/man8/tc-mirred.8.html
-        # Depening if we are the source or the target interface of the port
+        # Depending if we are the source or the target interface of the port
         # mirror we need to setup some variables.
 
         # Don't allow for netns yet
         if 'netns' in self.config:
             return None
 
-        source_if = self.config['ifname']
+        source_if = self.ifname
 
         mirror_config = None
         if 'mirror' in self.config:
@@ -1697,9 +1717,9 @@ class Interface(Control):
 
         # clear existing ingess - ignore errors (e.g. "Error: Cannot find specified
         # qdisc on specified device") - we simply cleanup all stuff here
-        if not 'traffic_policy' in self.config:
-            self._popen(f'tc qdisc del dev {source_if} parent ffff: 2>/dev/null');
-            self._popen(f'tc qdisc del dev {source_if} parent 1: 2>/dev/null');
+        if not 'qos' in self.config:
+            self._popen(f'tc qdisc del dev {source_if} root 2>/dev/null')
+            self._popen(f'tc qdisc del dev {source_if} ingress 2>/dev/null')
 
         # Apply interface mirror policy
         if mirror_config:
@@ -1711,14 +1731,14 @@ class Interface(Control):
                     handle = '1: root prio'
                     parent = '1:'
 
-                # Mirror egress traffic
+                # Mirror traffic
                 mirror_cmd  = f'tc qdisc add dev {source_if} handle {handle}; '
                 # Export the mirrored traffic to the interface
                 mirror_cmd += f'tc filter add dev {source_if} parent {parent} protocol '\
                               f'all prio 10 u32 match u32 0 0 flowid 1:1 action mirred '\
                               f'egress mirror dev {target_if}'
                 _, err = self._popen(mirror_cmd)
-                if err: print('tc qdisc(filter for mirror port failed')
+                if err: print('tc filter for mirror port failed')
 
         # Apply interface traffic redirection policy
         elif 'redirect' in self.config:
@@ -1729,7 +1749,7 @@ class Interface(Control):
             _, err = self._popen(f'tc filter add dev {source_if} parent ffff: protocol '\
                                  f'all prio 10 u32 match u32 0 0 flowid 1:1 action mirred '\
                                  f'egress redirect dev {target_if}')
-            if err: print('tc filter add for redirect failed')
+            if err: print('tc filter for redirect failed')
 
     def set_per_client_thread(self, enable):
         """
@@ -1811,9 +1831,9 @@ class Interface(Control):
                 os.unlink(wpa_supplicant_conf)
 
     def update(self, config):
-        """ General helper function which works on a dictionary retrived by
+        """ General helper function which works on a dictionary retrieved by
         get_config_dict(). It's main intention is to consolidate the scattered
-        interface setup code and provide a single point of entry when workin
+        interface setup code and provide a single point of entry when working
         on any interface. """
 
         if self.debug:

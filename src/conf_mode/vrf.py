@@ -177,7 +177,7 @@ def verify(vrf):
         for name, vrf_config in vrf['name'].items():
             # Reserved VRF names
             if name in reserved_names:
-                raise ConfigError(f'VRF name "{name}" is reserved and connot be used!')
+                raise ConfigError(f'VRF name "{name}" is reserved and cannot be used!')
 
             # table id is mandatory
             if 'table' not in vrf_config:
@@ -243,13 +243,13 @@ def apply(vrf):
     bind_all = '0'
     if 'bind_to_all' in vrf:
         bind_all = '1'
-    sysctl_write('net.ipv4.tcp_l3mdev_accept', bind_all)
-    sysctl_write('net.ipv4.udp_l3mdev_accept', bind_all)
+    sysctl_write(['net', 'ipv4', 'tcp_l3mdev_accept'], bind_all)
+    sysctl_write(['net', 'ipv4', 'udp_l3mdev_accept'], bind_all)
 
     for tmp in (dict_search('vrf_remove', vrf) or []):
         if interface_exists(tmp):
             # T5492: deleting a VRF instance may leafe processes running
-            # (e.g. dhclient) as there is a depedency ordering issue in the CLI.
+            # (e.g. dhclient) as there is a dependency ordering issue in the CLI.
             # We need to ensure that we stop the dhclient processes first so
             # a proper DHCLP RELEASE message is sent
             for interface in get_vrf_members(tmp):
@@ -264,6 +264,12 @@ def apply(vrf):
             if not err:
                 # Remove map element
                 cmd(f'nft {nft_del_element}')
+
+            # Remove all ip rules pointing to this VRF table
+            table_id = get_vrf_tableid(tmp)
+            for afi in ['-4', '-6']:
+                while call(f'ip {afi} rule del table {table_id}') == 0:
+                    pass
 
             # Delete the VRF Kernel interface
             call(f'ip link delete dev {tmp}')
@@ -342,7 +348,7 @@ def apply(vrf):
             cmd(f'nft {nft_add_element}')
 
         # Only call into nftables as long as there is nothing setup to avoid wasting
-        # CPU time and thus lenghten the commit process
+        # CPU time and thus lengthen the commit process
         if not nft_vrf_zone_rule_setup:
             nft_vrf_zone_rule_setup = is_nft_vrf_zone_rule_setup()
         # Install nftables conntrack rules only once

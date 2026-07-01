@@ -15,9 +15,10 @@
 # with this program; if not, write to the Free Software Foundation, Inc.,
 # 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
+import re
+
 from collections.abc import Callable
 from functools import wraps
-from re import search as re_search, MULTILINE as re_M
 from systemd import journal
 from time import sleep
 from typing import TypeVar, ParamSpec, Literal
@@ -330,7 +331,7 @@ class VPPControl:
         hw_info = self.cli_cmd(f'show hardware-interfaces {ifname}').reply
 
         regex_filter = r'^\s+pci: device (?P<device>\w+:\w+) subsystem (?P<subsystem>\w+:\w+) address (?P<address>\w+:\w+:\w+\.\w+) numa (?P<numa>\w+)$'
-        re_obj = re_search(regex_filter, hw_info, re_M)
+        re_obj = re.search(regex_filter, hw_info, re.MULTILINE)
 
         # return empty string if no interface or no PCI info was found
         if not hw_info or not re_obj:
@@ -421,8 +422,11 @@ class VPPControl:
             mtu (int): MTU
         """
         iface_index = self.get_sw_if_index(iface_name_vpp)
-        api_call_args: dict[str, str | int] = {'sw_if_index': iface_index, 'mtu': mtu}
-        return self.__vpp_api_client.api.hw_interface_set_mtu(**api_call_args)
+        api_call_args: dict[str, int | list[int]] = {
+            'sw_if_index': iface_index,
+            'mtu': [mtu, 0, 0, 0],
+        }
+        return self.__vpp_api_client.api.sw_interface_set_mtu(**api_call_args)
 
     @_Decorators.api_call
     def get_sw_if_dev_type(self, ifname: str) -> int | None:
@@ -438,26 +442,6 @@ class VPPControl:
             if iface.interface_name == ifname:
                 return iface.interface_dev_type
         return None
-
-    @_Decorators.api_call
-    def set_nat44_session_limit(self, session_limit: int) -> None:
-        """Set NAT44 session limit
-
-        Args:
-            session_limit (int): Maximum number of sessions per thread
-        """
-        self.__vpp_api_client.api.nat44_set_session_limit(
-            session_limit=session_limit,
-        )
-
-    @_Decorators.api_call
-    def set_nat_workers(self, workers: int) -> None:
-        """Set NAT44 session limit
-
-        Args:
-            workers (int): Bitmask of workers list
-        """
-        self.__vpp_api_client.api.nat_set_workers(worker_mask=workers)
 
     @property
     def connected(self) -> bool:
@@ -479,21 +463,53 @@ class VPPControl:
         return self.__vpp_api_client.api
 
     @_Decorators.api_call
-    def map_pppoe_interface(self, ifname: str, is_add: bool) -> None:
-        """Create or delete PPPoE mapping between data-plain and control-plane interfaces
+    def map_pppoe_interface(self, ifname: str) -> None:
+        """
+        Create PPPoE mapping between data-plane and control-plane interfaces.
 
         Args:
-            ifname (str): name of an interface in kernel
-            is_add (bool): create or delete mapping
+            ifname (str): Name of an interface in kernel.
         """
         vpp_pair = self.lcp_pair_find(kernel_name=ifname)
         if vpp_pair:
-            vpp_pair_name = vpp_pair['vpp_name_kernel']
+            vpp_iface_index = vpp_pair['vpp_index_hw']
+            vpp_pair_index = vpp_pair['vpp_index_kernel']
             self.__vpp_api_client.api.pppoe_add_del_cp(
-                dp_sw_if_index=self.get_sw_if_index(ifname),
-                cp_sw_if_index=self.get_sw_if_index(vpp_pair_name),
-                is_add=is_add,
+                dp_sw_if_index=vpp_iface_index,
+                cp_sw_if_index=vpp_pair_index,
+                is_add=True,
             )
+
+    @_Decorators.api_call
+    def get_pppoe_interface_mapping(self) -> dict:
+        """
+        Build a mapping between data-plane and control-plane interfaces.
+
+        Returns:
+            dict: Mapping of data-plane interface indices to control-plane interface indices.
+        """
+        result = {}
+        for binding in self.__vpp_api_client.api.pppoe_cp_binding_dump():
+            dp_index = binding.dp_sw_if_index
+            cp_index = binding.cp_sw_if_index
+            result[dp_index] = cp_index
+
+        return result
+
+    @_Decorators.api_call
+    def delete_pppoe_mapping(self, dp_index: int, cp_index: int) -> None:
+        """
+        Delete PPPoE mapping between data-plane and control-plane interfaces.
+
+        Args:
+            dp_index (int): Index of an interface in data-plane.
+            cp_index (int): Index of an interface in control plane.
+        """
+        self.__vpp_api_client.api.pppoe_add_del_cp(
+            dp_sw_if_index=dp_index,
+            cp_sw_if_index=cp_index,
+            is_add=False,
+        )
 
     @_Decorators.api_call
     def enable_dhcp_client(self, ifname: str) -> None:

@@ -156,6 +156,11 @@ chmod -R 775 /opt/vyatta/etc/config
 mkdir -p /opt/vyatta/etc/logrotate
 mkdir -p /opt/vyatta/etc/netdevice.d
 
+# T8326: GeoIP permissions
+mkdir -p /var/cache/vyos /usr/share/vyos-geoip
+chown -R root:vyattacfg /var/cache/vyos /usr/share/vyos-geoip
+chmod -R 775 /var/cache/vyos /usr/share/vyos-geoip
+
 touch /etc/environment
 
 if [ ! -f /etc/bash_completion ]; then
@@ -277,4 +282,9 @@ fi
 # Restart vyos-domain-resolver if running
 if systemctl is-active --quiet vyos-domain-resolver; then
     systemctl restart vyos-domain-resolver
+fi
+
+# Restart vyos-netlinkd if running
+if systemctl is-active --quiet vyos-netlinkd; then
+    systemctl restart vyos-netlinkd
 fi

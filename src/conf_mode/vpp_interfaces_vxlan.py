@@ -16,26 +16,25 @@
 # with this program; if not, write to the Free Software Foundation, Inc.,
 # 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
-import os
-
 from vyos import ConfigError
 
+from vyos.base import Warning
 from vyos.config import Config
-from vyos.configdict import leaf_node_changed
+from vyos.configdict import get_interface_dict
 from vyos.configdep import set_dependents, call_dependents
-from vyos.template import is_interface
+from vyos.configverify import verify_mtu_ipv6
+from vyos.ifconfig import Interface
+from vyos.template import is_ipv6
+from vyos.utils.network import get_interfaces_by_ip
+from vyos.utils.process import is_systemd_service_active
 
-from vyos.vpp.interface import VXLANInterface
+from vyos.ifconfig.vpp import VPPVXLANInterface
 from vyos.vpp.config_deps import deps_bridge_dict
 from vyos.vpp.config_deps import deps_xconnect_dict
-from vyos.vpp.config_verify import (
-    verify_vpp_remove_kernel_interface,
-    verify_vpp_change_kernel_interface,
-    verify_vpp_remove_xconnect_interface,
-    verify_vpp_exists_kernel_interface,
-    verify_vpp_tunnel_source_address,
-)
-from vyos.vpp.utils import cli_ifaces_lcp_kernel_list, cli_ethernet_with_vifs_ifaces
+from vyos.vpp.config_verify import verify_vpp_remove_bridge_interface
+from vyos.vpp.config_verify import verify_vpp_remove_xconnect_interface
+from vyos.vpp.config_verify import verify_vpp_tunnel_source_address
+from vyos.vpp.utils import cli_ethernet_with_vifs_ifaces
 
 
 def get_config(config=None) -> dict:
@@ -51,54 +50,13 @@ def get_config(config=None) -> dict:
     else:
         conf = Config()
 
-    base = ['vpp', 'interfaces', 'vxlan']
-    base_kernel_interfaces = ['vpp', 'kernel-interfaces']
+    base = ['interfaces', 'vpp', 'vxlan']
 
-    ifname = os.environ['VYOS_TAGNODE_VALUE']
+    ifname, config = get_interface_dict(conf, base)
 
-    # Get config_dict with default values
-    config = conf.get_config_dict(
-        base + [ifname],
-        key_mangling=('-', '_'),
-        get_first_key=True,
-        no_tag_node_value_mangle=True,
-        with_defaults=True,
-        with_recursive_defaults=True,
-    )
-
-    if not conf.exists(['vpp']):
+    if not conf.exists(['vpp']) and not conf.exists(base):
         config['remove_vpp'] = True
         return config
-
-    # Get effective config as we need full dicitonary per interface delete
-    effective_config = conf.get_config_dict(
-        base + [ifname],
-        key_mangling=('-', '_'),
-        effective=True,
-        get_first_key=True,
-        no_tag_node_value_mangle=True,
-    )
-
-    if effective_config:
-        config.update({'effective': effective_config})
-
-    if not conf.exists(base + [ifname]):
-        config['remove'] = True
-
-    # Get global 'vpp kernel-interfaces' for verify
-    config['vpp_kernel_interfaces'] = conf.get_config_dict(
-        base_kernel_interfaces,
-        key_mangling=('-', '_'),
-        get_first_key=True,
-        no_tag_node_value_mangle=True,
-    )
-
-    tmp = leaf_node_changed(conf, base + [ifname, 'kernel-interface'])
-    if tmp:
-        config['kernel_interface_removed'] = tmp
-
-    # list of all kernel interfaces `vpp interface xxx kernel-interface xxx`
-    config['candidate_kernel_interfaces'] = cli_ifaces_lcp_kernel_list(conf)
 
     # list of all Ethernet interfaces with vifs
     config['vpp_ether_vif_ifaces'] = cli_ethernet_with_vifs_ifaces(conf)
@@ -114,15 +72,18 @@ def get_config(config=None) -> dict:
         for bridge_iface in config['bridge_members'][ifname]:
             set_dependents('vpp_interfaces_bridge', conf, bridge_iface)
 
-    if effective_config.get('kernel_interface'):
-        if conf.exists(base + [ifname, 'kernel-interface']):
-            iface = config.get('kernel_interface')
-            if conf.exists(['vpp', 'kernel-interfaces', iface]):
-                set_dependents('vpp_kernel_interface', conf, iface)
+    # Get 'vpp settings' config with default values
+    config['vpp_settings'] = conf.get_config_dict(
+        ['vpp', 'settings'],
+        key_mangling=('-', '_'),
+        get_first_key=True,
+        no_tag_node_value_mangle=True,
+        with_defaults=True,
+    )
 
     # NAT dependency
-    if conf.exists(['vpp', 'nat44']):
-        set_dependents('vpp_nat', conf)
+    if conf.exists(['vpp', 'nat', 'nat44']):
+        set_dependents('vpp_nat_nat44', conf)
     if conf.exists(['vpp', 'nat', 'cgnat']):
         set_dependents('vpp_nat_cgnat', conf)
 
@@ -130,7 +91,6 @@ def get_config(config=None) -> dict:
     if conf.exists(['vpp', 'acl']):
         set_dependents('vpp_acl', conf)
 
-    config['ifname'] = ifname
     return config
 
 
@@ -139,15 +99,16 @@ def verify(config):
     if 'remove_vpp' in config:
         return None
 
-    # Verify that removed kernel interface is not used in 'vpp kernel-interfaces'.
-    # vpp interfaces vxlan vxlanX kernel-interface vpp-tunX
-    # vpp kernel-interface vpp-tunX
-    verify_vpp_remove_kernel_interface(config)
-
     verify_vpp_remove_xconnect_interface(config)
+    verify_vpp_remove_bridge_interface(config)
 
-    if 'remove' in config:
+    if 'deleted' in config:
         return None
+
+    if not is_systemd_service_active('vpp.service'):
+        raise ConfigError(
+            'Cannot configure VPP vxlan interface: vpp.service is not running'
+        )
 
     required_keys = {'source_address', 'remote', 'vni'}
     if not all(key in config for key in required_keys):
@@ -161,11 +122,28 @@ def verify(config):
     if config.get('source_address') == config.get('remote'):
         raise ConfigError('Remote address must not be the same as source address')
 
-    # Change 'vpp interfaces vxlan greX kernel-interface vpp-tunX'
-    #     => 'vpp interfaces gre vxlanX kernel-interface vpp-tunY'
-    # check if we have kernel interface config 'vpp kernel-interface vpp-tunX'
-    verify_vpp_change_kernel_interface(config)
-    verify_vpp_exists_kernel_interface(config)
+    # VXLAN adds at least an overhead of 50 bytes - we need to check the
+    # underlying device if our VXLAN package is not going to be fragmented!
+    source_address = config['source_address']
+    vxlan_overhead = 50
+    if is_ipv6(source_address):
+        # IPv6 adds an extra 20 bytes overhead because the IPv6 header is 20
+        # bytes larger than the IPv4 header - assuming no extra options are
+        # in use.
+        vxlan_overhead += 20
+
+    ifaces_with_ip = get_interfaces_by_ip(source_address)
+    vpp_ifaces = config['vpp_ether_vif_ifaces']
+    matching_iface = next((iface for iface in ifaces_with_ip if iface in vpp_ifaces))
+
+    lower_mtu = Interface(matching_iface).get_mtu()
+    if lower_mtu < (int(config['mtu']) + vxlan_overhead):
+        Warning(
+            f'Underlying device MTU is too small ({lower_mtu} bytes) '
+            f'for VXLAN overhead ({vxlan_overhead} bytes!)'
+        )
+
+    verify_mtu_ipv6(config)
 
 
 def generate(config):
@@ -178,29 +156,13 @@ def apply(config):
 
     ifname = config.get('ifname')
     # Delete interface
-    if 'effective' in config:
-        remove_config = config.get('effective')
-        src_addr = remove_config.get('source_address')
-        dst_addr = remove_config.get('remote')
-        vni = int(remove_config.get('vni'))
-        i = VXLANInterface(ifname, src_addr, dst_addr, vni)
-        i.delete()
+    vxlan = VPPVXLANInterface(ifname, config)
+    vxlan.remove()
 
-    if 'remove' in config:
+    if 'deleted' in config:
         return None
 
-    # Add interface
-    src_addr = config.get('source_address')
-    dst_addr = config.get('remote')
-    vni = int(config.get('vni'))
-    kernel_interface = config.get('kernel_interface', '')
-    state = 'up' if 'disable' not in config else 'down'
-    i = VXLANInterface(ifname, src_addr, dst_addr, vni, kernel_interface, state)
-    i.add()
-
-    # Add kernel-interface (LCP) if interface is not exist
-    if 'kernel_interface' in config and not is_interface(kernel_interface):
-        i.kernel_add()
+    vxlan.update(config)
 
     call_dependents()
 
